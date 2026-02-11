@@ -1,86 +1,121 @@
-import requests
-import torch
-from PIL import Image
-from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import time
+"""Main script for object detection with Grounding DINO."""
 
-model_id = "IDEA-Research/grounding-dino-tiny"
+import argparse
+from pathlib import Path
 
-# Check for available device: CUDA > MPS > CPU
-if torch.cuda.is_available():
-    device = "cuda"
-elif torch.backends.mps.is_available():
-    device = "mps"
-else:
-    device = "cpu"
-print("Using device:", device)
+from utils import get_device, load_image
+from detector import ObjectDetector
+from visualizer import DetectionVisualizer
+import config
 
-processor = AutoProcessor.from_pretrained(model_id)
-model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
-image_path = "/Users/psinha/Desktop/test_images/test_image_2.jpg"
-image = Image.open(image_path)
-
-text_labels = ["Green SweaterLady"]
-
-inputs = processor(images=image, text=text_labels, return_tensors="pt").to(device)
-
-# Start timing inference
-start_time = time.time()
-
-with torch.no_grad():
-    outputs = model(**inputs)
-
-results = processor.post_process_grounded_object_detection(
-    outputs,
-    inputs.input_ids,
-    threshold=0.4,
-    text_threshold=0.3,
-    target_sizes=[image.size[::-1]]
-)
-
-# End timing inference
-end_time = time.time()
-inference_time = end_time - start_time
-print(f"\nInference time: {inference_time:.3f} seconds ({inference_time*1000:.1f} ms)")
-
-result = results[0]
-
-for box, score, label in zip(result["boxes"], result["scores"], result["labels"]):
-    box = [round(x, 2) for x in box.tolist()]
-    print(f"Detected {label} with confidence {round(score.item(), 3)} at location {box}")
-
-# Draw bounding boxes on the image
-fig, ax = plt.subplots(1)
-ax.imshow(image)
-
-for box, score, label in zip(result["boxes"], result["scores"], result["labels"]):
-    if score < 0.4:
-        continue
-
-    xmin, ymin, xmax, ymax = box.tolist()
-
-    rect = patches.Rectangle(
-        (xmin, ymin),
-        xmax - xmin,
-        ymax - ymin,
-        linewidth=2,
-        edgecolor='red',
-        facecolor='none'
+def main(
+    image_source,
+    labels,
+    threshold=None,
+    text_threshold=None,
+    save_output=None,
+    no_display=False
+):
+    """
+    Run object detection on an image.
+    
+    Args:
+        image_source (str): Path or URL to the image
+        labels (list): List of text labels to detect
+        threshold (float, optional): Detection confidence threshold
+        text_threshold (float, optional): Text matching threshold
+        save_output (str, optional): Path to save the visualization
+        no_display (bool): If True, don't display the image
+    """
+    # Get device
+    device = get_device()
+    
+    # Load image
+    print(f"\nLoading image from: {image_source}")
+    image = load_image(image_source)
+    print(f"Image size: {image.size}")
+    
+    # Initialize detector
+    detector = ObjectDetector(device=device)
+    
+    # Run detection
+    print(f"\nDetecting objects with labels: {labels}")
+    results, inference_time = detector.detect(
+        image,
+        labels,
+        threshold=threshold,
+        text_threshold=text_threshold
     )
+    
+    # Print results
+    detector.print_results(results, inference_time)
+    
+    # Visualize results
+    if not no_display or save_output:
+        visualizer = DetectionVisualizer()
+        visualizer.draw_boxes(
+            image,
+            results,
+            min_confidence=threshold or config.DETECTION_THRESHOLD,
+            save_path=save_output
+        )
 
-    ax.add_patch(rect)
-    ax.text(
-        xmin,
-        ymin - 5,
-        f"{label}: {score:.2f}",
-        color='red',
-        fontsize=10,
-        backgroundcolor='white'
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Object detection using Grounding DINO"
     )
-
-plt.axis("off")
-plt.show()
-
+    
+    parser.add_argument(
+        "--image",
+        type=str,
+        required=True,
+        help="Path or URL to the input image"
+    )
+    
+    parser.add_argument(
+        "--labels",
+        type=str,
+        nargs="+",
+        default=config.DEFAULT_LABELS,
+        help="List of object labels to detect"
+    )
+    
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=config.DETECTION_THRESHOLD,
+        help="Detection confidence threshold (0-1)"
+    )
+    
+    parser.add_argument(
+        "--text-threshold",
+        type=float,
+        default=config.TEXT_THRESHOLD,
+        help="Text matching threshold (0-1)"
+    )
+    
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="Path to save the output visualization"
+    )
+    
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Don't display the visualization window"
+    )
+    
+    args = parser.parse_args()
+    
+    main(
+        image_source=args.image,
+        labels=args.labels,
+        threshold=args.threshold,
+        text_threshold=args.text_threshold,
+        save_output=args.save,
+        no_display=args.no_display
+    )
