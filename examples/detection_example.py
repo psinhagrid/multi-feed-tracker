@@ -1,8 +1,11 @@
 """Example script showing how to use the object detection library."""
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
+
 from utils import get_device, load_image
-from detector import ObjectDetector
-from visualizer import DetectionVisualizer
+from detection import ObjectDetector, DetectionVisualizer
 
 
 def example_local_image():

@@ -4,6 +4,9 @@ import time
 import torch
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
 import config
 
 

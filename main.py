@@ -4,8 +4,7 @@ import argparse
 from pathlib import Path
 
 from utils import get_device, load_image
-from detector import ObjectDetector
-from visualizer import DetectionVisualizer
+from detection import ObjectDetector, DetectionVisualizer
 import config
 
 

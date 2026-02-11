@@ -1,99 +1,158 @@
 # Multi-Feed Object Tracker
 
-A clean, modular object detection system using Grounding DINO for zero-shot object detection.
+A modular object detection and person re-identification system using Grounding DINO and ResNet50.
 
 ## Features
 
-- 🚀 Zero-shot object detection with Grounding DINO
-- 🎯 Support for custom text labels
-- 💻 GPU acceleration (CUDA, MPS, or CPU)
-- 📊 Visual bounding box overlay
-- ⚡ Performance timing
-- 🔧 Configurable thresholds and visualization settings
+- 🎯 **Zero-shot object detection** with Grounding DINO
+- 🧠 **Person re-identification** using ResNet50 features
+- 💻 **GPU acceleration** (CUDA, MPS, or CPU)
+- 📊 **Visual bounding box overlay**
+- ⚡ **Performance timing**
+- 🔧 **Configurable thresholds**
+- 📁 **Clean modular architecture**
 
 ## Project Structure
 
 ```
 Multi-Feed_Tracker/
-├── config.py              # Configuration settings
-├── detector.py            # Object detection model wrapper
-├── visualizer.py          # Visualization utilities
-├── main.py               # Main CLI script
-├── example.py            # Usage examples
-├── requirements.txt      # Python dependencies
-├── utils/
+├── config.py                  # Global configuration
+├── main.py                    # CLI for object detection
+├── requirements.txt           # Dependencies
+├── README.md
+│
+├── detection/                 # Object detection module
 │   ├── __init__.py
-│   ├── device.py         # Device selection utilities
-│   └── image_loader.py   # Image loading utilities
-└── README.md
+│   ├── detector.py           # Grounding DINO detector
+│   └── visualizer.py         # Bounding box visualization
+│
+├── tracking/                  # Person tracking & ReID module
+│   ├── __init__.py
+│   └── feature_extractor.py  # ResNet50 feature extraction
+│
+├── utils/                     # Utilities
+│   ├── __init__.py
+│   ├── device.py             # Device selection (CUDA/MPS/CPU)
+│   └── image_loader.py       # Image loading (URL/local)
+│
+└── examples/                  # Example scripts
+    ├── detection_example.py  # Detection examples
+    ├── reid_example.py       # Person ReID examples
+    └── reid_workflow.py      # Full ReID workflow
 ```
 
 ## Installation
 
-1. Create and activate a virtual environment:
+1. **Create and activate virtual environment:**
 ```bash
 python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate  # Windows: venv\Scripts\activate
 ```
 
-2. Install dependencies:
+2. **Install dependencies:**
 ```bash
 pip install -r requirements.txt
 ```
 
 ## Usage
 
-### Command Line Interface
+### 1. Object Detection
 
-Basic usage:
+**Basic detection:**
 ```bash
 python main.py --image path/to/image.jpg --labels "a person" "a car"
 ```
 
-With custom thresholds:
+**With custom thresholds:**
 ```bash
 python main.py --image path/to/image.jpg \
-               --labels "a cat" "a dog" \
+               --labels "a person" \
                --threshold 0.5 \
                --text-threshold 0.4
 ```
 
-Save output without displaying:
+**Save output:**
 ```bash
 python main.py --image path/to/image.jpg \
                --labels "a person" \
-               --save output.jpg \
-               --no-display
+               --save output.jpg
 ```
 
-From URL:
+### 2. Person Re-Identification
+
+**Compare two images:**
 ```bash
-python main.py --image "http://example.com/image.jpg" \
-               --labels "a car"
+python examples/reid_example.py \
+    --image1 person1.jpg \
+    --image2 person2.jpg
 ```
 
-### Programmatic Usage
+**Batch comparison (1 vs many):**
+```bash
+python examples/reid_example.py \
+    --image1 reference.jpg \
+    --image2 img1.jpg img2.jpg img3.jpg \
+    --batch
+```
 
+**Quiet mode (score only):**
+```bash
+python examples/reid_example.py \
+    --image1 person1.jpg \
+    --image2 person2.jpg \
+    --quiet
+```
+
+### 3. Programmatic Usage
+
+**Object Detection:**
 ```python
+from detection import ObjectDetector, DetectionVisualizer
 from utils import get_device, load_image
-from detector import ObjectDetector
-from visualizer import DetectionVisualizer
 
 # Initialize
 device = get_device()
 detector = ObjectDetector(device=device)
 visualizer = DetectionVisualizer()
 
-# Load and detect
+# Detect
 image = load_image("path/to/image.jpg")
-results, inference_time = detector.detect(image, ["a cat", "a dog"])
+results, time = detector.detect(image, ["a person", "a car"])
 
-# Display results
-detector.print_results(results, inference_time)
+# Visualize
 visualizer.draw_boxes(image, results)
 ```
 
-See `example.py` for more usage examples.
+**Person Re-Identification:**
+```python
+from tracking import FeatureExtractor
+
+# Initialize
+extractor = FeatureExtractor()
+
+# Compare two images
+features1 = extractor.extract_features("person1.jpg")
+features2 = extractor.extract_features("person2.jpg")
+
+similarity, interpretation = extractor.compute_similarity(
+    features1, features2, interpret=True
+)
+
+print(f"Similarity: {similarity:.4f}")
+print(f"Result: {interpretation}")
+```
+
+## Similarity Interpretation
+
+When comparing persons, the similarity score is interpreted as:
+
+| Score Range | Interpretation |
+|------------|----------------|
+| > 0.8      | ✅ Very likely same person |
+| 0.6-0.8    | ⚠️ Possible match |
+| < 0.6      | ❌ Probably different person |
+
+**Note:** These thresholds should be tuned based on your specific use case.
 
 ## Configuration
 
@@ -107,6 +166,7 @@ Edit `config.py` to customize:
 
 - Python 3.8+
 - PyTorch 2.0+
+- torchvision
 - transformers
 - Pillow
 - matplotlib
@@ -114,9 +174,26 @@ Edit `config.py` to customize:
 
 ## Performance
 
-- Supports CUDA (NVIDIA GPU), MPS (Apple Silicon), and CPU
-- Inference timing included in output
-- Model: Grounding DINO Tiny (lightweight and fast)
+- **GPU Support:** CUDA (NVIDIA), MPS (Apple Silicon), CPU fallback
+- **Inference timing:** Automatically measured and reported
+- **Models:**
+  - Detection: Grounding DINO Tiny (lightweight and fast)
+  - ReID: ResNet50 (2048-dim features)
+
+## Examples
+
+Run the example scripts to see the system in action:
+
+```bash
+# Detection examples
+python examples/detection_example.py
+
+# Person ReID examples  
+python examples/reid_example.py
+
+# Full ReID workflow (detect + track)
+python examples/reid_workflow.py
+```
 
 ## License
 

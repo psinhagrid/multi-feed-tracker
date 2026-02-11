@@ -9,10 +9,13 @@ Simple ReID workflow following the 4-step process:
 import torch
 import ssl
 from PIL import Image
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
 
 from utils import get_device, load_image
-from detector import ObjectDetector
-from feature_extractor import (
+from detection import ObjectDetector
+from tracking import (
     get_embedding,
     compare_embeddings,
     interpret_similarity

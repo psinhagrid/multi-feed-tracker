@@ -3,6 +3,9 @@
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
 import config
 
 

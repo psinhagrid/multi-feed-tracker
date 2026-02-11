@@ -1,10 +1,14 @@
 """Example: Person Re-Identification - Compare two images to check if same person."""
+###  python examples/reid_example.py --image1 /Users/psinha/Desktop/test_images/test_image_2.jpg --image2 /Users/psinha/Desktop/test_images/test_image_3.webp
 
 import argparse
 import torch
 from PIL import Image
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent.parent))
 
-from feature_extractor import (
+from tracking import (
     FeatureExtractor,
     get_embedding,
     compare_embeddings,
