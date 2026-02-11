@@ -6,6 +6,9 @@ import sys
 from pathlib import Path
 import argparse
 import numpy as np
+import time
+import threading
+from queue import Queue, Empty
 sys.path.append(str(Path(__file__).parent.parent))
 sys.path.append(str(Path(__file__).parent.parent / "tracker" / "bytetrack"))
 
@@ -19,7 +22,7 @@ from yolox.tracker.byte_tracker import BYTETracker
 
 def process_video(video_path, labels, detection_interval=None, show_display=True, use_tracking=True):
     """
-    Process video with object detection and tracking.
+    Process video with object detection and tracking using frame queue for smooth playback.
     
     Args:
         video_path (str): Path to video file
@@ -38,6 +41,7 @@ def process_video(video_path, labels, detection_interval=None, show_display=True
     detector = ObjectDetector(device=device)
     
     # Initialize ByteTrack tracker
+    tracker = None
     if use_tracking:
         print(f"Initializing ByteTrack tracker...")
         # ByteTrack args (tuned for DINO detections)
@@ -68,107 +72,151 @@ def process_video(video_path, labels, detection_interval=None, show_display=True
     print(f"Detection labels: {labels}")
     print(f"Detection interval: every {detection_interval} frames")
     print(f"Tracking: {'Enabled' if use_tracking else 'Disabled'}")
-    print("\nProcessing video... (Press 'q' to quit)\n")
+    print("\nProcessing video with frame queue for smooth playback...")
+    print("Press 'q' to quit\n")
     
-    frame_id = 0
-    current_results = None  # Store latest detection results
-    online_targets = []  # Store tracked objects
+    # Create frame queue for smooth playback
+    frame_queue = Queue(maxsize=fps * 2)  # Buffer 2 seconds of frames
+    stop_event = threading.Event()
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame_id += 1
-
-        # Resize frame for faster detection
-        h, w, _ = frame.shape
-        new_width = 640
-        new_height = int(h * (640 / w))
-        frame = cv2.resize(frame, (new_width, new_height))
-
-        # Convert to PIL for DINO
-        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-        # Detection every N frames
-        if frame_id % detection_interval == 0:
-            print(f"[Frame {frame_id}/{total_frames}] Running detection...")
-            current_results, inference_time = detector.detect(image, labels)
-            num_detections = len(current_results['boxes'])
-            print(f"  → Detected {num_detections} objects in {inference_time:.3f}s")
-            
-            # Print detection details
-            for idx, (box, score, label) in enumerate(zip(
-                current_results['boxes'], 
-                current_results['scores'], 
-                current_results['labels']
-            )):
-                print(f"    {idx+1}. {label}: {score:.3f}")
-            
-            # Convert detections to ByteTrack format
-            if use_tracking and num_detections > 0:
-                detections = []
-                for box, score in zip(current_results['boxes'], current_results['scores']):
-                    x1, y1, x2, y2 = box.tolist()
-                    detections.append([x1, y1, x2, y2, score.item()])
-                
-                detections = np.array(detections)
-                
-                # Update tracker
-                online_targets = tracker.update(detections, [height, width], [height, width])
-                print(f"  → Tracking {len(online_targets)} objects")
+    # Processing thread function
+    def process_frames():
+        frame_id = 0
+        current_results = None
+        online_targets = []
         
-        # Draw bounding boxes on frame
-        if use_tracking and len(online_targets) > 0:
-            # Draw tracked objects with IDs
-            for track in online_targets:
-                tlwh = track.tlwh
-                track_id = track.track_id
-                
-                xmin, ymin, w, h = int(tlwh[0]), int(tlwh[1]), int(tlwh[2]), int(tlwh[3])
-                xmax, ymax = xmin + w, ymin + h
-                
-                # Draw rectangle
-                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                
-                # Draw track ID
-                label_text = f"ID: {track_id}"
-                cv2.putText(frame, label_text, (xmin, ymin - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        elif current_results is not None and len(current_results['boxes']) > 0:
-            # Draw detection boxes (when tracking is disabled)
-            for box, score, label in zip(
-                current_results['boxes'],
-                current_results['scores'],
-                current_results['labels']
-            ):
-                if score >= config.DETECTION_THRESHOLD:
-                    # Get box coordinates
-                    xmin, ymin, xmax, ymax = box.tolist()
-                    xmin, ymin, xmax, ymax = int(xmin), int(ymin), int(xmax), int(ymax)
-                    
-                    # Draw rectangle
-                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
-                    
-                    # Draw label
-                    label_text = f"{label}: {score:.2f}"
-                    cv2.putText(frame, label_text, (xmin, ymin - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        # Display frame
-        if show_display:
-            cv2.imshow("Video Processing", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                print("\nStopped by user")
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
                 break
 
-    # Cleanup
-    cap.release()
-    if show_display:
-        cv2.destroyAllWindows()
+            frame_id += 1
+
+            # Resize frame for faster detection
+            h, w, _ = frame.shape
+            new_width = config.RESIZE_WIDTH
+            new_height = int(h * (config.RESIZE_WIDTH / w))
+            frame = cv2.resize(frame, (new_width, new_height))
+
+            # Convert to PIL for DINO
+            image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+            # Detection every N frames
+            if frame_id % detection_interval == 0:
+                print(f"[Frame {frame_id}/{total_frames}] Running detection...")
+                current_results, inference_time = detector.detect(image, labels)
+                num_detections = len(current_results['boxes'])
+                print(f"  → Detected {num_detections} objects in {inference_time:.3f}s")
+                
+                # Print detection details
+                for idx, (box, score, label) in enumerate(zip(
+                    current_results['boxes'], 
+                    current_results['scores'], 
+                    current_results['labels']
+                )):
+                    print(f"    {idx+1}. {label}: {score:.3f}")
+                
+                # Convert detections to ByteTrack format
+                if use_tracking and num_detections > 0:
+                    detections = []
+                    for box, score in zip(current_results['boxes'], current_results['scores']):
+                        x1, y1, x2, y2 = box.tolist()
+                        detections.append([x1, y1, x2, y2, score.item()])
+                    
+                    detections = np.array(detections)
+                    
+                    # Update tracker
+                    online_targets = tracker.update(detections, [new_height, new_width], [new_height, new_width])
+                    print(f"  → Tracking {len(online_targets)} objects")
+            
+            # Draw bounding boxes on frame
+            display_frame = frame.copy()
+            
+            if use_tracking and len(online_targets) > 0:
+                # Draw tracked objects with IDs
+                for track in online_targets:
+                    tlwh = track.tlwh
+                    track_id = track.track_id
+                    
+                    xmin, ymin, w, h = int(tlwh[0]), int(tlwh[1]), int(tlwh[2]), int(tlwh[3])
+                    xmax, ymax = xmin + w, ymin + h
+                    
+                    # Draw rectangle
+                    cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
+                    
+                    # Draw track ID
+                    label_text = f"ID: {track_id}"
+                    cv2.putText(display_frame, label_text, (xmin, ymin - 10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            elif current_results is not None and len(current_results['boxes']) > 0:
+                # Draw detection boxes (when tracking is disabled)
+                for box, score, label in zip(
+                    current_results['boxes'],
+                    current_results['scores'],
+                    current_results['labels']
+                ):
+                    if score >= config.DETECTION_THRESHOLD:
+                        # Get box coordinates
+                        xmin, ymin, xmax, ymax = box.tolist()
+                        xmin, ymin, xmax, ymax = int(xmin), int(ymin), int(xmax), int(ymax)
+                        
+                        # Draw rectangle
+                        cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+                        
+                        # Draw label
+                        label_text = f"{label}: {score:.2f}"
+                        cv2.putText(display_frame, label_text, (xmin, ymin - 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            # Put processed frame in queue (block if queue is full)
+            try:
+                frame_queue.put(display_frame, timeout=1)
+            except:
+                pass
+        
+        # Signal end of video
+        frame_queue.put(None)
+        cap.release()
+        print(f"\nProcessing complete. Processed {frame_id} frames.")
     
-    print(f"\nProcessing complete. Processed {frame_id} frames.")
+    # Start processing thread
+    process_thread = threading.Thread(target=process_frames, daemon=True)
+    process_thread.start()
+    
+    # Display thread (main thread) - shows frames at correct FPS
+    frame_delay = int(1000 / fps) if fps > 0 else 30
+    
+    if show_display:
+        while True:
+            try:
+                # Get frame from queue with timeout
+                frame = frame_queue.get(timeout=1)
+                
+                # None signals end of video
+                if frame is None:
+                    break
+                
+                # Display frame
+                cv2.imshow("Video Processing", frame)
+                
+                # Wait for calculated delay to maintain original FPS
+                key = cv2.waitKey(frame_delay) & 0xFF
+                if key == ord('q'):
+                    print("\nStopped by user")
+                    stop_event.set()
+                    break
+                    
+            except Empty:
+                continue
+        
+        # Cleanup
+        cv2.destroyAllWindows()
+    else:
+        # If not displaying, just wait for processing to complete
+        process_thread.join()
+    
+    stop_event.set()
 
 
 def parse_labels(label_input):

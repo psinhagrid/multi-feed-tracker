@@ -9,6 +9,7 @@ TEXT_THRESHOLD = 0.3
 
 # Video processing settings
 DETECTION_FRAME_INTERVAL = 20  # Run detection every N frames
+RESIZE_WIDTH = 640  # Resize frame width for faster detection (maintains aspect ratio)
 
 # Visualization settings
 BOX_COLOR = 'red'
@@ -18,4 +19,4 @@ TEXT_COLOR = 'red'
 TEXT_BACKGROUND = 'white'
 
 # Default labels (can be overridden)
-DEFAULT_LABELS = ["a cat", "a remote control"]
+DEFAULT_LABELS = ["Person"]
