@@ -7,6 +7,9 @@ MODEL_ID = "IDEA-Research/grounding-dino-tiny"
 DETECTION_THRESHOLD = 0.4
 TEXT_THRESHOLD = 0.3
 
+# Video processing settings
+DETECTION_FRAME_INTERVAL = 20  # Run detection every N frames
+
 # Visualization settings
 BOX_COLOR = 'red'
 BOX_LINEWIDTH = 2
