@@ -41,6 +41,9 @@ models/
 .cache/
 huggingface/
 
+# ByteTrack (cloned repository)
+tracker/bytetrack/
+
 # Images and videos (uncomment if you don't want to track them)
 # *.jpg
 # *.jpeg
