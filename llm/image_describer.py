@@ -63,25 +63,31 @@ def describe_image(
     }
     media_type = media_type_map.get(extension, 'image/jpeg')
     
-    prompt = """Analyze this cropped image and provide a short, descriptive label suitable for object detection and tracking.
+    prompt = """Analyze this cropped image and provide a label for object detection.
 
-Focus on the most distinctive visual features that would help identify this object/person across video frames:
-- Colors (clothing, body, etc.)
-- Type/category of object or person
-- Key visual characteristics
+CRITICAL RULES:
+1. Start with the base object type (person, dog, car, etc.)
+2. Add ONE most distinctive color OR feature
+3. Use simple common words only
+4. Maximum 2-3 words total
 
-Keep it concise and use 2-3 words that clearly describe what you see.
+Format: "[color] [object]" OR "[feature] [object]"
 
-Examples:
-- "red shirt person"
-- "blue jacket person"
-- "yellow raincoat person"
+GOOD examples:
+- "person in yellow"
+- "person in red"
+- "person in blue"
+- "yellow jacket"
+- "red car"
 - "brown dog"
-- "black cat"
-- "white car"
-- "green backpack"
+- "white shirt"
 
-Return ONLY the descriptive label, nothing else."""
+BAD examples (too specific):
+- "person with yellow raincoat and umbrella" (too long)
+- "golden retriever dog" (too specific breed)
+- "person wearing sunglasses" (temporary feature)
+
+Return ONLY the label in this exact format, nothing else."""
 
     try:
         message = client.messages.create(
