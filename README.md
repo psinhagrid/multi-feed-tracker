@@ -17,7 +17,7 @@ A modular object detection and person re-identification system using Grounding D
 ```
 Multi-Feed_Tracker/
 ├── config.py                  # Global configuration
-├── main.py                    # CLI for object detection
+├── starter.py                 # Main entry point
 ├── requirements.txt           # Dependencies
 ├── README.md
 │
@@ -29,6 +29,17 @@ Multi-Feed_Tracker/
 ├── tracking/                  # Person tracking & ReID module
 │   ├── __init__.py
 │   └── feature_extractor.py  # ResNet50 feature extraction
+│
+├── video_processing/          # Video processing pipeline
+│   ├── __init__.py
+│   └── video_processor.py    # Video tracking with ByteTrack
+│
+├── tools/                     # Utility tools
+│   └── roi_selector.py       # ROI selection and labeling
+│
+├── llm/                       # LLM integration
+│   ├── __init__.py
+│   └── image_describer.py    # Claude API for image labeling
 │
 ├── utils/                     # Utilities
 │   ├── __init__.py
@@ -56,29 +67,21 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Object Detection
+### 1. Video Tracking with Object Detection
 
-**Basic detection:**
+**Run video tracking pipeline:**
 ```bash
-python main.py --image path/to/image.jpg --labels "a person" "a car"
+python starter.py  # Uncomment Demo 1 in starter.py
 ```
 
-**With custom thresholds:**
+### 2. ROI Selection and Labeling
+
+**Select regions and generate AI labels:**
 ```bash
-python main.py --image path/to/image.jpg \
-               --labels "a person" \
-               --threshold 0.5 \
-               --text-threshold 0.4
+python starter.py  # Uncomment Demo 2 in starter.py (default)
 ```
 
-**Save output:**
-```bash
-python main.py --image path/to/image.jpg \
-               --labels "a person" \
-               --save output.jpg
-```
-
-### 2. Person Re-Identification
+### 3. Person Re-Identification
 
 **Compare two images:**
 ```bash
