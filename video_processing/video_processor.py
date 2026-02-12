@@ -46,13 +46,13 @@ def process_video(video_path, labels, detection_interval=None, show_display=True
         print(f"Initializing ByteTrack tracker...")
         # ByteTrack args (tuned for DINO detections)
         class TrackArgs:
-            track_thresh = 0.4  # Lowered to match DINO detection threshold
-            track_buffer = 30
-            match_thresh = 0.8
+            track_thresh = config.TRACK_THRESH
+            track_buffer = config.TRACK_BUFFER
+            match_thresh = config.MATCH_THRESH
             mot20 = False
         
         tracker = BYTETracker(TrackArgs(), frame_rate=30)
-        print("Tracker initialized (track_thresh=0.4)")
+        print(f"Tracker initialized (track_thresh={config.TRACK_THRESH})")
     
     # Open video
     print(f"Opening video: {video_path}")
@@ -116,58 +116,80 @@ def process_video(video_path, labels, detection_interval=None, show_display=True
                 )):
                     print(f"    {idx+1}. {label}: {score:.3f}")
                 
-                # Convert detections to ByteTrack format
-                if use_tracking and num_detections > 0:
-                    detections = []
-                    for box, score in zip(current_results['boxes'], current_results['scores']):
-                        x1, y1, x2, y2 = box.tolist()
-                        detections.append([x1, y1, x2, y2, score.item()])
+                # Convert detections to ByteTrack format and update tracker
+                if use_tracking:
+                    if num_detections > 0:
+                        detections = []
+                        for box, score in zip(current_results['boxes'], current_results['scores']):
+                            x1, y1, x2, y2 = box.tolist()
+                            detections.append([x1, y1, x2, y2, score.item()])
+                        
+                        detections = np.array(detections)
+                        print(f"  DEBUG: Detections shape={detections.shape}")
+                        print(f"  DEBUG: First box: x1={detections[0,0]:.1f}, y1={detections[0,1]:.1f}, x2={detections[0,2]:.1f}, y2={detections[0,3]:.1f}, score={detections[0,4]:.3f}")
+                        print(f"  DEBUG: Image size: height={new_height}, width={new_width}")
+                    else:
+                        detections = np.empty((0, 5))  # Empty array for no detections
                     
-                    detections = np.array(detections)
-                    
-                    # Update tracker
+                    # Update tracker with new detections
+                    # Using resized dimensions since detections are on resized frame
                     online_targets = tracker.update(detections, [new_height, new_width], [new_height, new_width])
                     print(f"  → Tracking {len(online_targets)} objects")
+                    if len(online_targets) > 0:
+                        for t in online_targets:
+                            print(f"    Track ID {t.track_id}: box={t.tlwh}")
+            elif use_tracking and len(online_targets) > 0:
+                # Between detections: use Kalman filter to predict next positions
+                # Don't call tracker.update() as it would mark all tracks as lost
+                from yolox.tracker.byte_tracker import STrack
+                STrack.multi_predict(online_targets)
             
             # Draw bounding boxes on frame
             display_frame = frame.copy()
             
-            if use_tracking and len(online_targets) > 0:
-                # Draw tracked objects with IDs
-                for track in online_targets:
-                    tlwh = track.tlwh
-                    track_id = track.track_id
+            if use_tracking:
+                # When tracking is enabled, always use green boxes
+                if len(online_targets) > 0:
+                    # Get class name from labels (assuming single class for now)
+                    class_name = labels[0].lower() if labels else "object"
                     
-                    xmin, ymin, w, h = int(tlwh[0]), int(tlwh[1]), int(tlwh[2]), int(tlwh[3])
-                    xmax, ymax = xmin + w, ymin + h
-                    
-                    # Draw rectangle
-                    cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                    
-                    # Draw track ID
-                    label_text = f"ID: {track_id}"
-                    cv2.putText(display_frame, label_text, (xmin, ymin - 10),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
-            elif current_results is not None and len(current_results['boxes']) > 0:
-                # Draw detection boxes (when tracking is disabled)
-                for box, score, label in zip(
-                    current_results['boxes'],
-                    current_results['scores'],
-                    current_results['labels']
-                ):
-                    if score >= config.DETECTION_THRESHOLD:
-                        # Get box coordinates
-                        xmin, ymin, xmax, ymax = box.tolist()
-                        xmin, ymin, xmax, ymax = int(xmin), int(ymin), int(xmax), int(ymax)
+                    # Draw tracked objects with IDs (GREEN)
+                    for track in online_targets:
+                        tlwh = track.tlwh
+                        track_id = track.track_id
+                        
+                        xmin, ymin, w, h = int(tlwh[0]), int(tlwh[1]), int(tlwh[2]), int(tlwh[3])
+                        xmax, ymax = xmin + w, ymin + h
                         
                         # Draw rectangle
-                        cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+                        cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
                         
-                        # Draw label
-                        label_text = f"{label}: {score:.2f}"
+                        # Draw track ID with class name (e.g., "person 1", "dog 2")
+                        label_text = f"{class_name} {track_id}"
                         cv2.putText(display_frame, label_text, (xmin, ymin - 10),
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                # If no tracks but have detections, don't draw anything (waiting for track to establish)
+            
+            else:
+                # Tracking disabled: draw detection boxes (RED)
+                if current_results is not None and len(current_results['boxes']) > 0:
+                    for box, score, label in zip(
+                        current_results['boxes'],
+                        current_results['scores'],
+                        current_results['labels']
+                    ):
+                        if score >= config.DETECTION_THRESHOLD:
+                            # Get box coordinates
+                            xmin, ymin, xmax, ymax = box.tolist()
+                            xmin, ymin, xmax, ymax = int(xmin), int(ymin), int(xmax), int(ymax)
+                            
+                            # Draw rectangle
+                            cv2.rectangle(display_frame, (xmin, ymin), (xmax, ymax), (0, 0, 255), 2)
+                            
+                            # Draw label
+                            label_text = f"{label}: {score:.2f}"
+                            cv2.putText(display_frame, label_text, (xmin, ymin - 10),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
             # Put processed frame in queue (block if queue is full)
             try:
