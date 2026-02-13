@@ -28,6 +28,9 @@ ENV/
 # Environment variables
 .env
 .env.local
+.env.production
+.env.development
+.env.test
 
 # PyTorch
 *.pth
@@ -61,3 +64,16 @@ results/
 .DS_Store
 .AppleDouble
 .LSOverride
+
+# Node / frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+frontend/vision-explorer/node_modules/
+frontend/vision-explorer/dist/
+frontend/vision-explorer/.vite/
+frontend/vision-explorer/.turbo/
+frontend/vision-explorer/.eslintcache
+frontend/vision-explorer/.DS_Store
