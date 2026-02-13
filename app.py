@@ -127,6 +127,16 @@ def pixels_to_percentage(x: int, y: int, w: int, h: int, frame_width: int, frame
     }
 
 
+@app.get("/api/track-label/{session_id}")
+async def get_track_label(session_id: str):
+    """Return last computed tracking label for this session"""
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    label = session.get("llm_label", "tracked object")
+    return {"label": label}
+
+
 # API Endpoints
 
 @app.get("/")
@@ -505,12 +515,15 @@ async def stream_video_with_tracking(
             # Get descriptive label from LLM
             llm_label = describe_image(tmp_path, api_key)
             print(f"LLM Label: {llm_label}")
+            # store label for frontend retrieval
+            session["llm_label"] = llm_label
             
             # Clean up temp file
             os.unlink(tmp_path)
         except Exception as e:
             print(f"LLM labeling failed: {e}")
             llm_label = "tracked object"
+            session["llm_label"] = llm_label
         
         # Loop the video indefinitely
         while True:
