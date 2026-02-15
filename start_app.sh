@@ -14,7 +14,7 @@ fi
 
 # Start backend in background
 echo ""
-echo "Starting FastAPI backend on port 8000..."
+echo "Starting FastAPI backend on port 8080..."
 python app.py &
 BACKEND_PID=$!
 echo "Backend PID: $BACKEND_PID"
@@ -23,17 +23,17 @@ echo "Backend PID: $BACKEND_PID"
 sleep 3
 
 # Check if backend started successfully
-if ! curl -s http://localhost:8000/ > /dev/null; then
+if ! curl -s http://localhost:8080/ > /dev/null; then
     echo "❌ Backend failed to start"
     kill $BACKEND_PID 2>/dev/null
     exit 1
 fi
 
-echo "✓ Backend running at http://localhost:8000"
+echo "✓ Backend running at http://localhost:8080"
 
 # Start frontend
 echo ""
-echo "Starting React frontend on port 5173..."
+echo "Starting React frontend on port 8000..."
 cd frontend/vision-explorer
 npm run dev &
 FRONTEND_PID=$!
@@ -43,9 +43,9 @@ echo "=========================================="
 echo "✓ Services Started Successfully"
 echo "=========================================="
 echo ""
-echo "Backend:  http://localhost:8000"
-echo "Frontend: http://localhost:5173"
-echo "API Docs: http://localhost:8000/docs"
+echo "Backend:  http://localhost:8080"
+echo "Frontend: http://localhost:8000"
+echo "API Docs: http://localhost:8080/docs"
 echo ""
 echo "Press Ctrl+C to stop all services"
 echo ""

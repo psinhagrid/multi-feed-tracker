@@ -35,6 +35,8 @@ app = FastAPI(title="VisionAI Studio API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
         "http://localhost:5173",
         "http://localhost:8081",
         "http://127.0.0.1:5173",
@@ -129,12 +131,49 @@ def pixels_to_percentage(x: int, y: int, w: int, h: int, frame_width: int, frame
 
 @app.get("/api/track-label/{session_id}")
 async def get_track_label(session_id: str):
-    """Return last computed tracking label for this session"""
+    """Return labels for all trackers in this session"""
     session = active_sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    label = session.get("llm_label", "tracked object")
-    return {"label": label}
+    trackers = session.get("trackers", [])
+    result = []
+    for t in trackers:
+        result.append({
+            "id": t.get("id", "T"),
+            "label": t.get("label", "tracked object"),
+            "status": t.get("status", "active")
+        })
+    # fallback if no trackers present
+    if not result and "llm_label" in session:
+        result.append({"id": "T1", "label": session["llm_label"], "status": "active"})
+    return {"trackers": result}
+
+
+@app.get("/api/track-snapshot/{session_id}")
+async def track_snapshot(session_id: str):
+    """Return the latest cached tracking frame (JPEG)."""
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    frame = session.get("last_frame")
+    if frame is None:
+        # Attempt to grab first frame as fallback
+        video_path = session["video_path"]
+        cap = cv2.VideoCapture(str(video_path))
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            raise HTTPException(status_code=400, detail="No frame available")
+
+    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ret:
+        raise HTTPException(status_code=500, detail="Could not encode snapshot")
+
+    return StreamingResponse(
+        io.BytesIO(buffer.tobytes()),
+        media_type="image/jpeg"
+    )
 
 
 # API Endpoints
@@ -321,7 +360,12 @@ async def upload_video(file: UploadFile = File(...)):
             "height": height,
             "duration": duration,
             "tracker": None,
-            "mode": None
+            "mode": None,
+            "trackers": [],
+            "track_labels": {},
+            "last_frame": None,
+            "original_w": None,
+            "original_h": None,
         }
         
         return {
@@ -431,10 +475,10 @@ async def detect_objects(request: DetectionRequest):
 @app.get("/api/track-stream/{session_id}")
 async def stream_video_with_tracking(
     session_id: str,
-    bbox_x: float,
-    bbox_y: float, 
-    bbox_width: float,
-    bbox_height: float,
+    bbox_x: Optional[float] = None,
+    bbox_y: Optional[float] = None, 
+    bbox_width: Optional[float] = None,
+    bbox_height: Optional[float] = None,
     render_w: Optional[float] = None,
     render_h: Optional[float] = None,
     frame_time: Optional[float] = None
@@ -447,172 +491,147 @@ async def stream_video_with_tracking(
     from llm.image_describer import describe_image
     import io
     
-    def generate_tracking_frames():
-        import time
-        
-        session = active_sessions.get(session_id)
-        if not session:
-            return
-        
-        video_path = session["video_path"]
-        fps_session = session.get("fps") or 30.0
-        
-        # Get first frame to get LLM label (seek to requested frame_time if provided)
-        cap_temp = cv2.VideoCapture(str(video_path))
-        if frame_time is not None and frame_time >= 0:
-            target_frame = int(frame_time * fps_session)
-            cap_temp.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-        ret, first_frame = cap_temp.read()
-        cap_temp.release()
-        
-        if not ret:
-            return
-        
-        original_h, original_w = first_frame.shape[:2]
-        
-        # Convert percentage coordinates to pixels; if render size provided, scale to original
-        if render_w and render_h:
-            disp_x = (bbox_x / 100.0) * render_w
-            disp_y = (bbox_y / 100.0) * render_h
-            disp_w = (bbox_width / 100.0) * render_w
-            disp_h = (bbox_height / 100.0) * render_h
-
-            scale_x = original_w / render_w
-            scale_y = original_h / render_h
-
+    def pct_to_px(bx: float, by: float, bw: float, bh: float, render_w_local: Optional[float], render_h_local: Optional[float], orig_w: int, orig_h: int):
+        if render_w_local and render_h_local:
+            disp_x = (bx / 100.0) * render_w_local
+            disp_y = (by / 100.0) * render_h_local
+            disp_w = (bw / 100.0) * render_w_local
+            disp_h = (bh / 100.0) * render_h_local
+            scale_x = orig_w / render_w_local
+            scale_y = orig_h / render_h_local
             x_px = int(disp_x * scale_x)
             y_px = int(disp_y * scale_y)
             w_px = int(disp_w * scale_x)
             h_px = int(disp_h * scale_y)
         else:
-            x_px = int((bbox_x / 100) * original_w)
-            y_px = int((bbox_y / 100) * original_h)
-            w_px = int((bbox_width / 100) * original_w)
-            h_px = int((bbox_height / 100) * original_h)
-        
-        print(f"Video dimensions: {original_w}x{original_h}")
-        print(f"Box percentages: x={bbox_x:.1f}%, y={bbox_y:.1f}%, w={bbox_width:.1f}%, h={bbox_height:.1f}%")
-        print(f"Box pixels: x={x_px}, y={y_px}, w={w_px}, h={h_px}")
-        
-        # Crop ROI and get LLM label (with bounds checking)
-        y_end = min(y_px + h_px, original_h)
-        x_end = min(x_px + w_px, original_w)
-        roi = first_frame[y_px:y_end, x_px:x_end]
-        
+            x_px = int((bx / 100.0) * orig_w)
+            y_px = int((by / 100.0) * orig_h)
+            w_px = int((bw / 100.0) * orig_w)
+            h_px = int((bh / 100.0) * orig_h)
+        x_px = max(0, min(x_px, orig_w - 1))
+        y_px = max(0, min(y_px, orig_h - 1))
+        w_px = max(1, min(w_px, orig_w - x_px))
+        h_px = max(1, min(h_px, orig_h - y_px))
+        return x_px, y_px, w_px, h_px
+
+    def run_llm_label(frame, bbox_px):
         try:
-            # Save ROI temporarily
             import tempfile
             import os
             from dotenv import load_dotenv
-            
             load_dotenv()
             api_key = os.getenv("ANTHROPIC_API_KEY")
-            
-            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+            x_px, y_px, w_px, h_px = bbox_px
+            y_end = min(y_px + h_px, frame.shape[0])
+            x_end = min(x_px + w_px, frame.shape[1])
+            roi = frame[y_px:y_end, x_px:x_end]
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 cv2.imwrite(tmp.name, roi)
                 tmp_path = tmp.name
-            
-            # Get descriptive label from LLM
-            llm_label = describe_image(tmp_path, api_key)
-            print(f"LLM Label: {llm_label}")
-            # store label for frontend retrieval
-            session["llm_label"] = llm_label
-            
-            # Clean up temp file
+            llm_label_local = describe_image(tmp_path, api_key)
             os.unlink(tmp_path)
+            return llm_label_local
         except Exception as e:
             print(f"LLM labeling failed: {e}")
-            llm_label = "tracked object"
-            session["llm_label"] = llm_label
-        
+            return "tracked object"
+
+    def generate_tracking_frames():
+        import time
+        session = active_sessions.get(session_id)
+        if not session:
+            return
+
+        video_path = session["video_path"]
+        fps_session = session.get("fps") or 30.0
+
+        # Only initialize first tracker if trackers list is empty
+        if not session.get("trackers"):
+            # First tracker requires bbox parameters
+            if bbox_x is None or bbox_y is None or bbox_width is None or bbox_height is None:
+                print("Error: bbox parameters required for first tracker initialization")
+                return
+                
+            session["trackers"] = []
+            session["track_labels"] = {}
+
+            # Get first frame (with optional seek) to initialize
+            cap_temp = cv2.VideoCapture(str(video_path))
+            if frame_time is not None and frame_time >= 0:
+                target_frame = int(frame_time * fps_session)
+                cap_temp.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ret, first_frame = cap_temp.read()
+            cap_temp.release()
+            if not ret:
+                return
+
+            orig_h, orig_w = first_frame.shape[:2]
+            session["original_w"] = orig_w
+            session["original_h"] = orig_h
+            session["last_frame"] = first_frame.copy()
+
+            # Create first tracker
+            x_px, y_px, w_px, h_px = pct_to_px(bbox_x, bbox_y, bbox_width, bbox_height, render_w, render_h, orig_w, orig_h)
+            llm_label = run_llm_label(first_frame, (x_px, y_px, w_px, h_px))
+            tracker = cv2.TrackerCSRT.create()
+            tracker.init(first_frame, (x_px, y_px, w_px, h_px))
+            session["trackers"].append({
+                "id": "T1",
+                "tracker": tracker,
+                "label": llm_label,
+                "status": "active",
+                "fail_count": 0,
+            })
+            session["track_labels"]["T1"] = llm_label
+
         # Loop the video indefinitely
         while True:
             cap = cv2.VideoCapture(str(video_path))
-            
-            # Get video FPS for proper timing
             fps = cap.get(cv2.CAP_PROP_FPS)
             fps = fps if fps > 0 else fps_session
             frame_delay = 1.0 / fps if fps > 0 else 1.0 / 30.0
-            
-            # Seek to requested frame_time if provided
+
             if frame_time is not None and frame_time >= 0:
                 target_frame = int(frame_time * fps)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-            
-            # Get first frame to initialize tracker
-            ret, first_frame = cap.read()
-            if not ret:
-                cap.release()
-                continue
-            
-            # Use the SAME dimensions as the original frame; scale with render metrics if provided
-            if render_w and render_h:
-                disp_x = (bbox_x / 100.0) * render_w
-                disp_y = (bbox_y / 100.0) * render_h
-                disp_w = (bbox_width / 100.0) * render_w
-                disp_h = (bbox_height / 100.0) * render_h
 
-                scale_x = original_w / render_w
-                scale_y = original_h / render_h
-
-                x_px_loop = int(disp_x * scale_x)
-                y_px_loop = int(disp_y * scale_y)
-                w_px_loop = int(disp_w * scale_x)
-                h_px_loop = int(disp_h * scale_y)
-            else:
-                x_px_loop = int((bbox_x / 100) * original_w)
-                y_px_loop = int((bbox_y / 100) * original_h)
-                w_px_loop = int((bbox_width / 100) * original_w)
-                h_px_loop = int((bbox_height / 100) * original_h)
-            
-            # Initialize CSRT tracker
-            tracker = cv2.TrackerCSRT.create()
-            tracker.init(first_frame, (x_px_loop, y_px_loop, w_px_loop, h_px_loop))
-            
-            frame_idx = 0
-            
-            # Process first frame with LLM label
-            cv2.rectangle(first_frame, (x_px, y_px), (x_px + w_px, y_px + h_px), (0, 255, 0), 3)
-            (text_width, text_height), baseline = cv2.getTextSize(llm_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(first_frame, (x_px, y_px - text_height - baseline - 5), (x_px + text_width, y_px), (0, 0, 0), -1)
-            cv2.putText(first_frame, llm_label, (x_px, y_px - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            ret, buffer = cv2.imencode('.jpg', first_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            
             while cap.isOpened():
                 frame_start_time = time.time()
-                
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # Update tracker
-                success, bbox = tracker.update(frame)
-                
-                if success:
-                    # Draw tracking box with LLM label
-                    x, y, w_box, h_box = [int(v) for v in bbox]
-                    cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 3)
-                    (text_width, text_height), baseline = cv2.getTextSize(llm_label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                    cv2.rectangle(frame, (x, y - text_height - baseline - 5), (x + text_width, y), (0, 0, 0), -1)
-                    cv2.putText(frame, llm_label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                else:
-                    # Lost tracking
-                    cv2.putText(frame, "LOST", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
-                
+
+                # Update all trackers
+                for t in list(session["trackers"]):
+                    success, bbox = t["tracker"].update(frame)
+                    if success:
+                        x, y, w_box, h_box = [int(v) for v in bbox]
+                        cv2.rectangle(frame, (x, y), (x + w_box, y + h_box), (0, 255, 0), 3)
+                        (text_width, text_height), baseline = cv2.getTextSize(t["label"], cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                        cv2.rectangle(frame, (x, y - text_height - baseline - 5), (x + text_width, y), (0, 0, 0), -1)
+                        cv2.putText(frame, t["label"], (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        t["status"] = "active"
+                        t["fail_count"] = 0
+                        session["track_labels"][t["id"]] = t["label"]
+                    else:
+                        t["fail_count"] += 1
+                        t["status"] = "lost"
+                        cv2.putText(frame, f"{t['id']} LOST", (50, 50 + 20 * int(t['id'][1:] or 1)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        if t["fail_count"] > 30:
+                            session["trackers"].remove(t)
+
+                # Save frame with boxes drawn for snapshot
+                session["last_frame"] = frame.copy()
+
                 # Encode and yield frame
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-                
-                frame_idx += 1
-                
+
                 # Control frame rate
                 elapsed = time.time() - frame_start_time
                 target_delay = frame_delay * 1.5
                 sleep_time = max(target_delay - elapsed, 0.001)
                 time.sleep(sleep_time)
-            
+
             cap.release()
     
     return StreamingResponse(
@@ -694,6 +713,114 @@ async def debug_track_frame(
         io.BytesIO(buffer.tobytes()),
         media_type="image/jpeg"
     )
+
+
+@app.post("/api/track-add/{session_id}")
+async def add_tracker(
+    session_id: str,
+    bbox_x: float,
+    bbox_y: float,
+    bbox_width: float,
+    bbox_height: float,
+    render_w: Optional[float] = None,
+    render_h: Optional[float] = None,
+    frame_time: Optional[float] = None
+):
+    """
+    Add an additional CSRT tracker during an active tracking session.
+    Uses the latest cached frame (or seeks) to init tracker and run LLM label.
+    """
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    video_path = session["video_path"]
+    fps_session = session.get("fps") or 30.0
+
+    # Helper to convert pct to px using stored original dims
+    def pct_to_px_local(bx, by, bw, bh, render_w_local, render_h_local, orig_w, orig_h):
+        if render_w_local and render_h_local:
+            disp_x = (bx / 100.0) * render_w_local
+            disp_y = (by / 100.0) * render_h_local
+            disp_w = (bw / 100.0) * render_w_local
+            disp_h = (bh / 100.0) * render_h_local
+            scale_x = orig_w / render_w_local
+            scale_y = orig_h / render_h_local
+            x_px = int(disp_x * scale_x)
+            y_px = int(disp_y * scale_y)
+            w_px = int(disp_w * scale_x)
+            h_px = int(disp_h * scale_y)
+        else:
+            x_px = int((bx / 100.0) * orig_w)
+            y_px = int((by / 100.0) * orig_h)
+            w_px = int((bw / 100.0) * orig_w)
+            h_px = int((bh / 100.0) * orig_h)
+        x_px = max(0, min(x_px, orig_w - 1))
+        y_px = max(0, min(y_px, orig_h - 1))
+        w_px = max(1, min(w_px, orig_w - x_px))
+        h_px = max(1, min(h_px, orig_h - y_px))
+        return x_px, y_px, w_px, h_px
+
+    orig_w = session.get("original_w")
+    orig_h = session.get("original_h")
+
+    # Get a frame to initialize tracker
+    frame = session.get("last_frame")
+    if frame is None:
+        cap = cv2.VideoCapture(str(video_path))
+        if frame_time is not None and frame_time >= 0:
+            target_frame = int(frame_time * fps_session)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        cap.release()
+        if not ret:
+            raise HTTPException(status_code=400, detail="Could not read frame to add tracker")
+
+    if orig_w is None or orig_h is None:
+        orig_h, orig_w = frame.shape[:2]
+        session["original_w"] = orig_w
+        session["original_h"] = orig_h
+
+    x_px, y_px, w_px, h_px = pct_to_px_local(bbox_x, bbox_y, bbox_width, bbox_height, render_w, render_h, orig_w, orig_h)
+
+    # LLM label
+    try:
+        from llm.image_describer import describe_image
+        import tempfile
+        import os
+        from dotenv import load_dotenv
+        load_dotenv()
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        y_end = min(y_px + h_px, frame.shape[0])
+        x_end = min(x_px + w_px, frame.shape[1])
+        roi = frame[y_px:y_end, x_px:x_end]
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            cv2.imwrite(tmp.name, roi)
+            tmp_path = tmp.name
+        llm_label = describe_image(tmp_path, api_key)
+        os.unlink(tmp_path)
+    except Exception as e:
+        print(f"LLM labeling failed (add tracker): {e}")
+        llm_label = "tracked object"
+
+    tracker = cv2.TrackerCSRT.create()
+    tracker.init(frame, (x_px, y_px, w_px, h_px))
+
+    tracker_id = f"T{len(session.get('trackers', [])) + 1}"
+    session.setdefault("trackers", []).append({
+        "id": tracker_id,
+        "tracker": tracker,
+        "label": llm_label,
+        "status": "active",
+        "fail_count": 0,
+    })
+    session.setdefault("track_labels", {})[tracker_id] = llm_label
+
+    return {
+        "id": tracker_id,
+        "label": llm_label,
+        "status": "active"
+    }
 
 
 @app.post("/api/track")
@@ -920,7 +1047,7 @@ if __name__ == "__main__":
     print("Backend:  http://localhost:8080")
     print("API Docs: http://localhost:8080/docs")
     print("Health:   http://localhost:8080/api/health")
-    print("Frontend: http://localhost:5173")
+    print("Frontend: http://localhost:8000")
     print("=" * 70)
     print("Detector will be initialized on first request (lazy loading)")
     print("=" * 70)
