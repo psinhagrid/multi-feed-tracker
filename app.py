@@ -241,6 +241,7 @@ async def stream_video_with_boxes(
             
             frame_idx = 0
             last_boxes = []
+            trackers = []  # List of (tracker, label, score) tuples
             
             while cap.isOpened():
                 frame_start_time = time.time()
@@ -259,8 +260,9 @@ async def stream_video_with_boxes(
                     pil_image = Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
                     results, _ = det.detect(pil_image, [query], threshold=threshold)
                     
-                    # Store boxes scaled to original size
+                    # Store boxes scaled to original size and reinit trackers
                     last_boxes = []
+                    trackers = []
                     for box, score in zip(results['boxes'], results['scores']):
                         if score >= threshold:
                             x1, y1, x2, y2 = box.tolist()
@@ -269,7 +271,24 @@ async def stream_video_with_boxes(
                             scale_y = h / new_height
                             x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
                             y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
+                            
+                            # Initialize CSRT tracker for this detection
+                            tracker = cv2.TrackerCSRT.create()
+                            bbox = (x1, y1, x2 - x1, y2 - y1)  # (x, y, w, h)
+                            tracker.init(frame, bbox)
+                            trackers.append((tracker, query, score))
                             last_boxes.append(((x1, y1, x2, y2), score))
+                else:
+                    # Track existing objects in between detections
+                    last_boxes = []
+                    updated_trackers = []
+                    for tracker, label, score in trackers:
+                        success, bbox = tracker.update(frame)
+                        if success:
+                            x, y, w_box, h_box = [int(v) for v in bbox]
+                            last_boxes.append(((x, y, x + w_box, y + h_box), score))
+                            updated_trackers.append((tracker, label, score))
+                    trackers = updated_trackers
                 
                 # Draw boxes on frame with more prominent style
                 for (x1, y1, x2, y2), score in last_boxes:
@@ -571,6 +590,17 @@ async def stream_video_with_tracking(
 
             # Create first tracker
             x_px, y_px, w_px, h_px = pct_to_px(bbox_x, bbox_y, bbox_width, bbox_height, render_w, render_h, orig_w, orig_h)
+            
+            # DEBUG: Save first tracker ROI
+            debug_dir = Path("debug_rois")
+            debug_dir.mkdir(exist_ok=True)
+            y_end = min(y_px + h_px, first_frame.shape[0])
+            x_end = min(x_px + w_px, first_frame.shape[1])
+            roi_debug = first_frame[y_px:y_end, x_px:x_end]
+            debug_path = debug_dir / f"roi_{session_id}_T1.jpg"
+            cv2.imwrite(str(debug_path), roi_debug)
+            print(f"[DEBUG] Saved T1 ROI to: {debug_path}")
+            
             llm_label = run_llm_label(first_frame, (x_px, y_px, w_px, h_px))
             tracker = cv2.TrackerCSRT.create()
             tracker.init(first_frame, (x_px, y_px, w_px, h_px))
@@ -590,7 +620,13 @@ async def stream_video_with_tracking(
             fps = fps if fps > 0 else fps_session
             frame_delay = 1.0 / fps if fps > 0 else 1.0 / 30.0
 
-            if frame_time is not None and frame_time >= 0:
+            # Resume from stored position if available, otherwise use frame_time parameter
+            resume_frame_time = session.get("current_frame_time")
+            if resume_frame_time is not None and resume_frame_time >= 0:
+                target_frame = int(resume_frame_time * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                print(f"Resuming from frame {target_frame} (time: {resume_frame_time:.2f}s)")
+            elif frame_time is not None and frame_time >= 0:
                 target_frame = int(frame_time * fps)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
 
@@ -600,6 +636,11 @@ async def stream_video_with_tracking(
                 if not ret:
                     break
 
+                # Store current frame number for resume
+                current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                session["current_frame"] = current_frame_num
+                session["current_frame_time"] = current_frame_num / fps if fps > 0 else 0
+                
                 # Update all trackers
                 for t in list(session["trackers"]):
                     success, bbox = t["tracker"].update(frame)
@@ -794,6 +835,14 @@ async def add_tracker(
         y_end = min(y_px + h_px, frame.shape[0])
         x_end = min(x_px + w_px, frame.shape[1])
         roi = frame[y_px:y_end, x_px:x_end]
+        
+        # DEBUG: Save ROI to debug folder for visualization
+        debug_dir = Path("debug_rois")
+        debug_dir.mkdir(exist_ok=True)
+        debug_path = debug_dir / f"roi_{session_id}_{len(session.get('trackers', []))}.jpg"
+        cv2.imwrite(str(debug_path), roi)
+        print(f"[DEBUG] Saved ROI to: {debug_path}")
+        
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             cv2.imwrite(tmp.name, roi)
             tmp_path = tmp.name
@@ -977,7 +1026,8 @@ async def delete_session(session_id: str):
         
         return {"status": "session_deleted", "session_id": session_id}
     
-    raise HTTPException(status_code=404, detail="Session not found")
+    # Return success even if session doesn't exist (idempotent delete)
+    return {"status": "session_already_deleted", "session_id": session_id}
 
 
 @app.websocket("/ws/track/{session_id}")
