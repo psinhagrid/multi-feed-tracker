@@ -108,88 +108,20 @@ Or press `Ctrl+C` in the terminal running `start_app.sh`.
 python starter.py  # Uncomment Demo 1 in starter.py
 ```
 
-### 3. ROI Selection and Labeling
-
-**Select regions and generate AI labels:**
-```bash
-python starter.py  # Uncomment Demo 2 in starter.py (default)
-```
-
-### 3. Person Re-Identification
-
-**Compare two images:**
-```bash
-python examples/reid_example.py \
-    --image1 person1.jpg \
-    --image2 person2.jpg
-```
-
-**Batch comparison (1 vs many):**
-```bash
-python examples/reid_example.py \
-    --image1 reference.jpg \
-    --image2 img1.jpg img2.jpg img3.jpg \
-    --batch
-```
-
-**Quiet mode (score only):**
-```bash
-python examples/reid_example.py \
-    --image1 person1.jpg \
-    --image2 person2.jpg \
-    --quiet
-```
-
 ### 3. Programmatic Usage
 
 **Object Detection:**
 ```python
-from detection import ObjectDetector, DetectionVisualizer
-from utils import get_device, load_image
+from detection import ObjectDetector
+from utils import get_device
 
 # Initialize
 device = get_device()
 detector = ObjectDetector(device=device)
-visualizer = DetectionVisualizer()
 
-# Detect
-image = load_image("path/to/image.jpg")
+# Detect objects in image
 results, time = detector.detect(image, ["a person", "a car"])
-
-# Visualize
-visualizer.draw_boxes(image, results)
 ```
-
-**Person Re-Identification:**
-```python
-from tracking import FeatureExtractor
-
-# Initialize
-extractor = FeatureExtractor()
-
-# Compare two images
-features1 = extractor.extract_features("person1.jpg")
-features2 = extractor.extract_features("person2.jpg")
-
-similarity, interpretation = extractor.compute_similarity(
-    features1, features2, interpret=True
-)
-
-print(f"Similarity: {similarity:.4f}")
-print(f"Result: {interpretation}")
-```
-
-## Similarity Interpretation
-
-When comparing persons, the similarity score is interpreted as:
-
-| Score Range | Interpretation |
-|------------|----------------|
-| > 0.8      | ✅ Very likely same person |
-| 0.6-0.8    | ⚠️ Possible match |
-| < 0.6      | ❌ Probably different person |
-
-**Note:** These thresholds should be tuned based on your specific use case.
 
 ## Configuration
 
@@ -215,22 +147,17 @@ Edit `config.py` to customize:
 - **Inference timing:** Automatically measured and reported
 - **Models:**
   - Detection: Grounding DINO Tiny (lightweight and fast)
-  - ReID: ResNet50 (2048-dim features)
+  - Tracking: CSRT (Discriminative Correlation Filter with Channel and Spatial Reliability)
 
-## Examples
+## Features
 
-Run the example scripts to see the system in action:
-
-```bash
-# Detection examples
-python examples/detection_example.py
-
-# Person ReID examples  
-python examples/reid_example.py
-
-# Full ReID workflow (detect + track)
-python examples/reid_workflow.py
-```
+- ✅ Multi-object tracking with CSRT
+- ✅ AI-powered object labeling with Claude API
+- ✅ Detect-then-track cycle for automatic detection mode
+- ✅ Confidence threshold filtering
+- ✅ Real-time video streaming with bounding boxes
+- ✅ Frame-accurate pause and resume
+- ✅ Multiple trackers per video
 
 ## License
 

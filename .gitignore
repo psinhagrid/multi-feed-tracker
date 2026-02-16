@@ -59,6 +59,7 @@ tracker/bytetrack/
 output/
 results/
 *.log
+debug_rois/
 
 # macOS
 .DS_Store

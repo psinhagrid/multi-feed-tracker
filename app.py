@@ -233,7 +233,18 @@ async def stream_video_with_boxes(
         
         # Loop the video indefinitely
         while True:
+            # Check if session still exists and video file is valid
+            if session_id not in active_sessions:
+                return
+            
+            if not Path(video_path).exists():
+                return
+            
             cap = cv2.VideoCapture(str(video_path))
+            
+            if not cap.isOpened():
+                cap.release()
+                return
             
             # Get video FPS for proper timing
             fps = cap.get(cv2.CAP_PROP_FPS)
