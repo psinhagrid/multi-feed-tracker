@@ -16,40 +16,33 @@ A modular object detection and person re-identification system using Grounding D
 
 ```
 Multi-Feed_Tracker/
-├── config.py                  # Global configuration
-├── starter.py                 # Main entry point
-├── requirements.txt           # Dependencies
+├── app.py                    # FastAPI backend server
+├── config.py                 # Configuration settings
+├── requirements.txt          # Python dependencies
+├── start_app.sh             # Startup script
+├── stop_app.sh              # Stop script
 ├── README.md
+├── QUICK_START.md
 │
-├── detection/                 # Object detection module
+├── detection/                # Object detection module
 │   ├── __init__.py
-│   ├── detector.py           # Grounding DINO detector
-│   └── visualizer.py         # Bounding box visualization
+│   ├── detector.py          # Grounding DINO detector
+│   └── visualizer.py        # Bounding box visualization
 │
-├── tracking/                  # Person tracking & ReID module
+├── llm/                      # LLM integration
 │   ├── __init__.py
-│   └── feature_extractor.py  # ResNet50 feature extraction
+│   └── image_describer.py   # Claude API for object labeling
 │
-├── video_processing/          # Video processing pipeline
+├── utils/                    # Utility functions
 │   ├── __init__.py
-│   └── video_processor.py    # Video tracking with ByteTrack
+│   ├── device.py            # Device selection (CUDA/MPS/CPU)
+│   └── image_loader.py      # Image loading utilities
 │
-├── tools/                     # Utility tools
-│   └── roi_selector.py       # ROI selection and labeling
-│
-├── llm/                       # LLM integration
-│   ├── __init__.py
-│   └── image_describer.py    # Claude API for image labeling
-│
-├── utils/                     # Utilities
-│   ├── __init__.py
-│   ├── device.py             # Device selection (CUDA/MPS/CPU)
-│   └── image_loader.py       # Image loading (URL/local)
-│
-└── examples/                  # Example scripts
-    ├── detection_example.py  # Detection examples
-    ├── reid_example.py       # Person ReID examples
-    └── reid_workflow.py      # Full ReID workflow
+└── frontend/                 # React web interface
+    └── vision-explorer/
+        ├── src/
+        ├── package.json
+        └── vite.config.ts
 ```
 
 ## Installation
