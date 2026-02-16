@@ -65,16 +65,50 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## Quick Start
+
+### Start the Application (Backend + Frontend)
+
+```bash
+# Activate virtual environment
+source venv/bin/activate
+
+# Start both services
+./start_app.sh
+```
+
+This will start:
+- **Backend** (FastAPI): http://localhost:8080
+- **Frontend** (React): http://localhost:8000
+- **API Docs**: http://localhost:8080/docs
+
+### Stop the Application
+
+```bash
+./stop_app.sh
+```
+
+Or press `Ctrl+C` in the terminal running `start_app.sh`.
+
 ## Usage
 
-### 1. Video Tracking with Object Detection
+### 1. Web Interface (Recommended)
+
+1. Start the application with `./start_app.sh`
+2. Open http://localhost:8000 in your browser
+3. Upload a video file
+4. Choose tracking mode:
+   - **Track**: Manual tracker placement with CSRT tracking
+   - **Identify**: Automatic detection with AI labeling
+
+### 2. Video Tracking with Object Detection
 
 **Run video tracking pipeline:**
 ```bash
 python starter.py  # Uncomment Demo 1 in starter.py
 ```
 
-### 2. ROI Selection and Labeling
+### 3. ROI Selection and Labeling
 
 **Select regions and generate AI labels:**
 ```bash
