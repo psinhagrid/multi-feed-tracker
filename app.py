@@ -3,30 +3,38 @@ FastAPI Backend for VisionAI Studio
 Connects React frontend with Python object detection and tracking
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import cv2
-import numpy as np
-from pathlib import Path
+import asyncio
+import io
+import json
+import os
 import tempfile
 import uuid
-import asyncio
-import json
-import io
-from PIL import Image
-import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import cv2
 from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from PIL import Image
 
-# Import your detection and tracking modules
-from detection import ObjectDetector
-from utils import get_device
-from llm.image_describer import describe_image
 import config
+from detection import ObjectDetector
+from llm.image_describer import describe_image
+from schemas import BoundingBox, DetectionRequest, DetectionResponse, TrackingRequest
+from utils import (
+    create_tracker,
+    get_device,
+    get_video_metadata,
+    label_roi_from_frame,
+    pct_to_px,
+    percentage_to_pixels,
+    pixels_to_percentage,
+    save_roi_debug,
+    save_uploaded_video,
+)
 
-# Load environment variables
 load_dotenv()
 
 app = FastAPI(title="VisionAI Studio API", version="1.0.0")
@@ -62,71 +70,6 @@ def get_detector():
         detector = ObjectDetector(device=device)
         print(f"Detector initialized on {device}")
     return detector
-
-
-# Pydantic models
-class BoundingBox(BaseModel):
-    id: str
-    x: float  # percentage
-    y: float  # percentage
-    width: float  # percentage
-    height: float  # percentage
-    label: str
-    confidence: float
-    type: str  # "detection" or "tracking"
-    status: Optional[str] = "active"  # "active" or "lost"
-    frame_number: Optional[int] = None  # Which frame this box belongs to
-
-
-class DetectionRequest(BaseModel):
-    session_id: str
-    query: str
-    threshold: float = 0.5
-
-
-class TrackingRequest(BaseModel):
-    session_id: str
-    bbox: Dict[str, float]  # {x, y, width, height} in percentages
-
-
-class DetectionResponse(BaseModel):
-    boxes: List[BoundingBox]
-    fps: float
-    frame_count: int
-
-
-# Helper functions
-def save_uploaded_video(file: UploadFile) -> Path:
-    """Save uploaded video to temp directory"""
-    temp_dir = Path(tempfile.gettempdir()) / "visionai"
-    temp_dir.mkdir(exist_ok=True)
-    
-    video_id = str(uuid.uuid4())
-    video_path = temp_dir / f"{video_id}.mp4"
-    
-    with open(video_path, "wb") as f:
-        f.write(file.file.read())
-    
-    return video_path
-
-
-def percentage_to_pixels(bbox: Dict[str, float], frame_width: int, frame_height: int) -> tuple:
-    """Convert percentage coordinates to pixel coordinates"""
-    x = int(bbox["x"] * frame_width / 100)
-    y = int(bbox["y"] * frame_height / 100)
-    w = int(bbox["width"] * frame_width / 100)
-    h = int(bbox["height"] * frame_height / 100)
-    return (x, y, w, h)
-
-
-def pixels_to_percentage(x: int, y: int, w: int, h: int, frame_width: int, frame_height: int) -> Dict[str, float]:
-    """Convert pixel coordinates to percentage coordinates"""
-    return {
-        "x": (x / frame_width) * 100,
-        "y": (y / frame_height) * 100,
-        "width": (w / frame_width) * 100,
-        "height": (h / frame_height) * 100,
-    }
 
 
 @app.get("/api/track-label/{session_id}")
@@ -284,7 +227,7 @@ async def stream_video_with_boxes(
                             y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
                             
                             # Initialize CSRT tracker for this detection
-                            tracker = cv2.TrackerCSRT.create()
+                            tracker = create_tracker()
                             bbox = (x1, y1, x2 - x1, y2 - y1)  # (x, y, w, h)
                             tracker.init(frame, bbox)
                             trackers.append((tracker, query, score))
@@ -366,29 +309,20 @@ async def upload_video(file: UploadFile = File(...)):
         
         # Save video
         video_path = save_uploaded_video(file)
-        
-        # Get video metadata
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Could not open video file")
-        
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = frame_count / fps if fps > 0 else 0
-        
-        cap.release()
-        
+        try:
+            metadata = get_video_metadata(video_path)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
         # Create session
         session_id = str(uuid.uuid4())
         active_sessions[session_id] = {
             "video_path": video_path,
-            "fps": fps,
-            "frame_count": frame_count,
-            "width": width,
-            "height": height,
-            "duration": duration,
+            "fps": metadata["fps"],
+            "frame_count": metadata["frame_count"],
+            "width": metadata["width"],
+            "height": metadata["height"],
+            "duration": metadata["duration"],
             "tracker": None,
             "mode": None,
             "trackers": [],
@@ -397,16 +331,16 @@ async def upload_video(file: UploadFile = File(...)):
             "original_w": None,
             "original_h": None,
         }
-        
+
         return {
             "session_id": session_id,
             "metadata": {
-                "fps": fps,
-                "frame_count": frame_count,
-                "width": width,
-                "height": height,
-                "duration": duration
-            }
+                "fps": metadata["fps"],
+                "frame_count": metadata["frame_count"],
+                "width": metadata["width"],
+                "height": metadata["height"],
+                "duration": metadata["duration"],
+            },
         }
     
     except Exception as e:
@@ -517,54 +451,6 @@ async def stream_video_with_tracking(
     Stream video with CSRT tracking - draws boxes on backend and streams
     Gets label from LLM first, then tracks with that label
     """
-    from fastapi.responses import StreamingResponse
-    from llm.image_describer import describe_image
-    import io
-    
-    def pct_to_px(bx: float, by: float, bw: float, bh: float, render_w_local: Optional[float], render_h_local: Optional[float], orig_w: int, orig_h: int):
-        if render_w_local and render_h_local:
-            disp_x = (bx / 100.0) * render_w_local
-            disp_y = (by / 100.0) * render_h_local
-            disp_w = (bw / 100.0) * render_w_local
-            disp_h = (bh / 100.0) * render_h_local
-            scale_x = orig_w / render_w_local
-            scale_y = orig_h / render_h_local
-            x_px = int(disp_x * scale_x)
-            y_px = int(disp_y * scale_y)
-            w_px = int(disp_w * scale_x)
-            h_px = int(disp_h * scale_y)
-        else:
-            x_px = int((bx / 100.0) * orig_w)
-            y_px = int((by / 100.0) * orig_h)
-            w_px = int((bw / 100.0) * orig_w)
-            h_px = int((bh / 100.0) * orig_h)
-        x_px = max(0, min(x_px, orig_w - 1))
-        y_px = max(0, min(y_px, orig_h - 1))
-        w_px = max(1, min(w_px, orig_w - x_px))
-        h_px = max(1, min(h_px, orig_h - y_px))
-        return x_px, y_px, w_px, h_px
-
-    def run_llm_label(frame, bbox_px):
-        try:
-            import tempfile
-            import os
-            from dotenv import load_dotenv
-            load_dotenv()
-            api_key = os.getenv("ANTHROPIC_API_KEY")
-            x_px, y_px, w_px, h_px = bbox_px
-            y_end = min(y_px + h_px, frame.shape[0])
-            x_end = min(x_px + w_px, frame.shape[1])
-            roi = frame[y_px:y_end, x_px:x_end]
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-                cv2.imwrite(tmp.name, roi)
-                tmp_path = tmp.name
-            llm_label_local = describe_image(tmp_path, api_key)
-            os.unlink(tmp_path)
-            return llm_label_local
-        except Exception as e:
-            print(f"LLM labeling failed: {e}")
-            return "tracked object"
-
     def generate_tracking_frames():
         import time
         session = active_sessions.get(session_id)
@@ -600,20 +486,13 @@ async def stream_video_with_tracking(
             session["last_frame"] = first_frame.copy()
 
             # Create first tracker
-            x_px, y_px, w_px, h_px = pct_to_px(bbox_x, bbox_y, bbox_width, bbox_height, render_w, render_h, orig_w, orig_h)
+            x_px, y_px, w_px, h_px = pct_to_px(
+                bbox_x, bbox_y, bbox_width, bbox_height, orig_w, orig_h, render_w, render_h
+            )
+            save_roi_debug(first_frame, (x_px, y_px, w_px, h_px), session_id, "T1")
             
-            # DEBUG: Save first tracker ROI
-            debug_dir = Path("debug_rois")
-            debug_dir.mkdir(exist_ok=True)
-            y_end = min(y_px + h_px, first_frame.shape[0])
-            x_end = min(x_px + w_px, first_frame.shape[1])
-            roi_debug = first_frame[y_px:y_end, x_px:x_end]
-            debug_path = debug_dir / f"roi_{session_id}_T1.jpg"
-            cv2.imwrite(str(debug_path), roi_debug)
-            print(f"[DEBUG] Saved T1 ROI to: {debug_path}")
-            
-            llm_label = run_llm_label(first_frame, (x_px, y_px, w_px, h_px))
-            tracker = cv2.TrackerCSRT.create()
+            llm_label = label_roi_from_frame(first_frame, (x_px, y_px, w_px, h_px))
+            tracker = create_tracker()
             tracker.init(first_frame, (x_px, y_px, w_px, h_px))
             session["trackers"].append({
                 "id": "T1",
@@ -736,31 +615,10 @@ async def debug_track_frame(
         raise HTTPException(status_code=400, detail="Could not read first frame")
 
     original_h, original_w = frame.shape[:2]
-
-    if render_w and render_h:
-        disp_x = (bbox_x / 100.0) * render_w
-        disp_y = (bbox_y / 100.0) * render_h
-        disp_w = (bbox_width / 100.0) * render_w
-        disp_h = (bbox_height / 100.0) * render_h
-
-        scale_x = original_w / render_w
-        scale_y = original_h / render_h
-
-        x_px = int(disp_x * scale_x)
-        y_px = int(disp_y * scale_y)
-        w_px = int(disp_w * scale_x)
-        h_px = int(disp_h * scale_y)
-    else:
-        x_px = int((bbox_x / 100) * original_w)
-        y_px = int((bbox_y / 100) * original_h)
-        w_px = int((bbox_width / 100) * original_w)
-        h_px = int((bbox_height / 100) * original_h)
-
-    # Clamp ROI within frame
-    x_px = max(0, min(x_px, original_w - 1))
-    y_px = max(0, min(y_px, original_h - 1))
-    w_px = max(1, min(w_px, original_w - x_px))
-    h_px = max(1, min(h_px, original_h - y_px))
+    x_px, y_px, w_px, h_px = pct_to_px(
+        bbox_x, bbox_y, bbox_width, bbox_height,
+        original_w, original_h, render_w, render_h
+    )
 
     # Draw box for debugging
     cv2.rectangle(frame, (x_px, y_px), (x_px + w_px, y_px + h_px), (255, 0, 255), 3)
@@ -800,31 +658,6 @@ async def add_tracker(
 
     video_path = session["video_path"]
     fps_session = session.get("fps") or 30.0
-
-    # Helper to convert pct to px using stored original dims
-    def pct_to_px_local(bx, by, bw, bh, render_w_local, render_h_local, orig_w, orig_h):
-        if render_w_local and render_h_local:
-            disp_x = (bx / 100.0) * render_w_local
-            disp_y = (by / 100.0) * render_h_local
-            disp_w = (bw / 100.0) * render_w_local
-            disp_h = (bh / 100.0) * render_h_local
-            scale_x = orig_w / render_w_local
-            scale_y = orig_h / render_h_local
-            x_px = int(disp_x * scale_x)
-            y_px = int(disp_y * scale_y)
-            w_px = int(disp_w * scale_x)
-            h_px = int(disp_h * scale_y)
-        else:
-            x_px = int((bx / 100.0) * orig_w)
-            y_px = int((by / 100.0) * orig_h)
-            w_px = int((bw / 100.0) * orig_w)
-            h_px = int((bh / 100.0) * orig_h)
-        x_px = max(0, min(x_px, orig_w - 1))
-        y_px = max(0, min(y_px, orig_h - 1))
-        w_px = max(1, min(w_px, orig_w - x_px))
-        h_px = max(1, min(h_px, orig_h - y_px))
-        return x_px, y_px, w_px, h_px
-
     orig_w = session.get("original_w")
     orig_h = session.get("original_h")
 
@@ -845,40 +678,16 @@ async def add_tracker(
         session["original_w"] = orig_w
         session["original_h"] = orig_h
 
-    x_px, y_px, w_px, h_px = pct_to_px_local(bbox_x, bbox_y, bbox_width, bbox_height, render_w, render_h, orig_w, orig_h)
+    x_px, y_px, w_px, h_px = pct_to_px(
+        bbox_x, bbox_y, bbox_width, bbox_height, orig_w, orig_h, render_w, render_h
+    )
+    tracker_id = f"T{len(session.get('trackers', [])) + 1}"
+    save_roi_debug(frame, (x_px, y_px, w_px, h_px), session_id, tracker_id)
+    llm_label = label_roi_from_frame(frame, (x_px, y_px, w_px, h_px))
 
-    # LLM label
-    try:
-        from llm.image_describer import describe_image
-        import tempfile
-        import os
-        from dotenv import load_dotenv
-        load_dotenv()
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        y_end = min(y_px + h_px, frame.shape[0])
-        x_end = min(x_px + w_px, frame.shape[1])
-        roi = frame[y_px:y_end, x_px:x_end]
-        
-        # DEBUG: Save ROI to debug folder for visualization
-        debug_dir = Path("debug_rois")
-        debug_dir.mkdir(exist_ok=True)
-        debug_path = debug_dir / f"roi_{session_id}_{len(session.get('trackers', []))}.jpg"
-        cv2.imwrite(str(debug_path), roi)
-        print(f"[DEBUG] Saved ROI to: {debug_path}")
-        
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            cv2.imwrite(tmp.name, roi)
-            tmp_path = tmp.name
-        llm_label = describe_image(tmp_path, api_key)
-        os.unlink(tmp_path)
-    except Exception as e:
-        print(f"LLM labeling failed (add tracker): {e}")
-        llm_label = "tracked object"
-
-    tracker = cv2.TrackerCSRT.create()
+    tracker = create_tracker()
     tracker.init(frame, (x_px, y_px, w_px, h_px))
 
-    tracker_id = f"T{len(session.get('trackers', [])) + 1}"
     session.setdefault("trackers", []).append({
         "id": tracker_id,
         "tracker": tracker,
@@ -920,7 +729,7 @@ async def start_tracking(request: TrackingRequest):
         bbox_pixels = percentage_to_pixels(request.bbox, w, h)
         
         # Initialize CSRT tracker
-        tracker = cv2.TrackerCSRT.create()
+        tracker = create_tracker()
         tracker.init(frame, bbox_pixels)
         
         cap.release()
