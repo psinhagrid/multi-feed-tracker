@@ -525,6 +525,10 @@ async def stream_video_with_tracking(
             })
             session["track_labels"]["T1"] = llm_label
 
+        # Clear any stale resume position from a previous (possibly interrupted) stream.
+        # This prevents "Resuming from frame N" on every new stream request.
+        session["current_frame_time"] = None
+
         # Loop the video indefinitely
         while True:
             # Check if session still exists and video file is valid
@@ -544,12 +548,12 @@ async def stream_video_with_tracking(
             fps = fps if fps > 0 else fps_session
             frame_delay = 1.0 / fps if fps > 0 else 1.0 / 30.0
 
-            # Resume from stored position if available, otherwise use frame_time parameter
+            # On first loop, seek to the frame where the user drew the box.
+            # Subsequent loops always start from the beginning (current_frame_time is None).
             resume_frame_time = session.get("current_frame_time")
             if resume_frame_time is not None and resume_frame_time >= 0:
                 target_frame = int(resume_frame_time * fps)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
-                print(f"Resuming from frame {target_frame} (time: {resume_frame_time:.2f}s)")
             elif frame_time is not None and frame_time >= 0:
                 target_frame = int(frame_time * fps)
                 cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
@@ -1065,8 +1069,17 @@ async def reid_stream(
             "detection_frame": None, # the EXACT frame detection ran on (use for tracker.init)
         }
 
-        def run_detection_reid(frame_copy):
-            """Run detect + Re-ID on a copy of the frame; store result in det_state."""
+        # How much better a NEW person's sim must be to override spatial continuity.
+        # Prevents brief switches to a wrong person with only marginally higher score.
+        SWITCH_SIM_MARGIN = 0.02
+
+        def run_detection_reid(frame_copy, last_tracked_box=None):
+            """Run detect + Re-ID on a copy of the frame; store result in det_state.
+
+            last_tracked_box: (x1,y1,x2,y2) of the currently tracked person.
+            Used for spatial consistency — prefer the candidate near the current
+            position unless another person scores SWITCH_SIM_MARGIN higher.
+            """
             new_results = []
             t0 = time.time()
             try:
@@ -1083,9 +1096,7 @@ async def reid_stream(
                 print(f"[Re-ID] DINO detect: {len(detections)} people in {time.time()-t_det:.2f}s", flush=True)
 
                 scale_x, scale_y = w / nw, h / nh
-                best_box = None
-                best_sim = -1.0
-                all_sims = []
+                candidates = []  # list of (box_xyxy, matched, sim)
                 for i, (box, score) in enumerate(detections):
                     x1, y1, x2, y2 = box.tolist()
                     x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
@@ -1101,17 +1112,61 @@ async def reid_stream(
                     except Exception as re:
                         matched, sim = False, 0.0
                         print(f"  person {i+1}: Re-ID extract FAILED: {re}")
-                    all_sims.append(sim)
+                    candidates.append(((x1, y1, x2, y2), matched, sim))
                     print(f"  person {i+1}: sim={sim:.3f} matched={matched} reid_time={time.time()-t_reid:.2f}s box=({x1},{y1},{x2},{y2})")
-                    if sim > best_sim:
-                        best_sim = sim
-                        best_box = ((x1, y1, x2, y2), matched, sim)
 
-                if best_box is not None and best_sim >= 0.2:
-                    new_results = [best_box]
-                    print(f"[Re-ID] Best match: sim={best_sim:.3f} matched={best_box[1]} (threshold={match_thresh})", flush=True)
-                else:
-                    print(f"[Re-ID] No match found (best_sim={best_sim:.3f} < 0.2 or no detections). All sims: {[f'{s:.2f}' for s in all_sims]}", flush=True)
+                if candidates:
+                    # Sort by similarity descending
+                    candidates.sort(key=lambda c: -c[2])
+                    global_best = candidates[0]
+                    global_best_sim = global_best[2]
+
+                    chosen = global_best  # default: highest similarity
+
+                    # ── Spatial consistency ───────────────────────────────────
+                    # If we already have a tracked position, find which candidate
+                    # is spatially closest to it. Prefer that candidate UNLESS
+                    # the globally highest-sim candidate is clearly better
+                    # (margin > SWITCH_SIM_MARGIN). This prevents brief flashes to
+                    # a wrong person with a marginally higher score.
+                    if last_tracked_box is not None:
+                        lx1, ly1, lx2, ly2 = last_tracked_box
+                        last_cx = (lx1 + lx2) / 2.0
+                        last_cy = (ly1 + ly2) / 2.0
+
+                        # Find nearest candidate to current tracked position
+                        nearest = min(
+                            candidates,
+                            key=lambda c: (
+                                ((c[0][0] + c[0][2]) / 2.0 - last_cx) ** 2
+                                + ((c[0][1] + c[0][3]) / 2.0 - last_cy) ** 2
+                            ),
+                        )
+                        nearest_sim = nearest[2]
+
+                        # Only switch away from the spatially-nearest if the
+                        # global best is significantly better
+                        if global_best_sim - nearest_sim <= SWITCH_SIM_MARGIN:
+                            chosen = nearest
+                            print(
+                                f"[Re-ID] Spatial lock: keeping nearest candidate "
+                                f"(sim={nearest_sim:.3f}) over global best "
+                                f"(sim={global_best_sim:.3f}, gap={global_best_sim-nearest_sim:.3f} < {SWITCH_SIM_MARGIN})",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[Re-ID] Switching to higher-sim candidate "
+                                f"(sim={global_best_sim:.3f} vs nearest={nearest_sim:.3f}, "
+                                f"gap={global_best_sim-nearest_sim:.3f} >= {SWITCH_SIM_MARGIN})",
+                                flush=True,
+                            )
+
+                    if chosen[2] >= 0.2:
+                        new_results = [chosen]
+                        print(f"[Re-ID] Chosen: sim={chosen[2]:.3f} matched={chosen[1]} box={chosen[0]}", flush=True)
+                    else:
+                        print(f"[Re-ID] No confident match (best sim={chosen[2]:.3f} < 0.2). All: {[f'{c[2]:.2f}' for c in candidates]}", flush=True)
 
                 print(f"[Re-ID] Total detection+reid time: {time.time()-t0:.2f}s", flush=True)
             except Exception as e:
@@ -1174,10 +1229,12 @@ async def reid_stream(
                     if not already_running:
                         with det_lock:
                             det_state["running"] = True
-                        print(f"[Re-ID] Scheduling detection thread at frame {frame_idx}", flush=True)
+                        # Pass current tracked position for spatial consistency check
+                        current_tracked_box = last_boxes[0][0] if last_boxes else None
+                        print(f"[Re-ID] Scheduling detection thread at frame {frame_idx} last_box={current_tracked_box}", flush=True)
                         t = threading.Thread(
                             target=run_detection_reid,
-                            args=(frame.copy(),),
+                            args=(frame.copy(), current_tracked_box),
                             daemon=True,
                         )
                         t.start()
