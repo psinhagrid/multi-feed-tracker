@@ -963,12 +963,20 @@ async def reid_set_reference(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to extract embedding: {e}")
 
+    # Ask LLM to label the reference crop (same as Track mode)
+    try:
+        ref_label = label_roi_from_frame(frame, bbox)
+    except Exception:
+        ref_label = "person"
+
     # Store as list for JSON compatibility; we use numpy when matching
     session["reference_embedding"] = embedding.tolist()
     session["reference_frame"] = frame  # keep for display
+    session["reference_label"] = ref_label
     session["step"] = "upload_v2"
 
-    return {"status": "reference_set", "embedding_shape": list(embedding.shape)}
+    print(f"[Re-ID] Reference set. LLM label: '{ref_label}'", flush=True)
+    return {"status": "reference_set", "embedding_shape": list(embedding.shape), "label": ref_label}
 
 
 @app.post("/api/reid-upload-video2")
@@ -1034,6 +1042,7 @@ async def reid_stream(
     import numpy as np
     ref_emb_np = np.array(ref_emb, dtype=np.float32)
     match_thresh = getattr(config, "REID_MATCH_THRESHOLD", 0.5)
+    ref_label = session.get("reference_label", "person")
 
     def generate_frames():
         import time
@@ -1225,14 +1234,14 @@ async def reid_stream(
                 if frame_idx % 30 == 0:
                     print(f"[Re-ID] Frame {frame_idx}: {len(trackers)} trackers, {len(last_boxes)} boxes drawn", flush=True)
 
-                # Draw boxes
+                # Draw boxes — use LLM label like Track mode, with similarity %
                 for (x1, y1, x2, y2), matched, sim in last_boxes:
                     color = (0, 255, 0) if matched else (0, 165, 255)
-                    label = f"MATCH {sim:.2f}" if matched else f"sim {sim:.2f}"
+                    box_label = f"{ref_label} {int(sim * 100)}%"
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    (tw, th), _ = cv2.getTextSize(box_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw, y1), (0, 0, 0), -1)
-                    cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    cv2.putText(frame, box_label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 ret2, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
@@ -1251,6 +1260,15 @@ async def reid_stream(
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/api/reid-label/{session_id}")
+async def reid_label(session_id: str):
+    """Return the LLM label for the reference person."""
+    session = reid_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Re-ID session not found")
+    return {"label": session.get("reference_label", "person")}
 
 
 @app.get("/api/reid-snapshot/{session_id}")
