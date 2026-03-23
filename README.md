@@ -12,6 +12,38 @@ A modular object detection and person re-identification system using Grounding D
 - 🔧 **Configurable thresholds**
 - 📁 **Clean modular architecture**
 
+## Business Requirements
+
+### Project Overview
+Multi-Feed Object Tracker is designed to provide an intelligent video surveillance and analysis solution that enables real-time object detection and person re-identification across multiple video feeds.
+
+### Key Business Objectives
+- **Automated Surveillance**: Reduce manual monitoring effort by providing automated object detection and tracking capabilities
+- **Person Re-identification**: Enable tracking of individuals across different camera feeds and time periods
+- **Real-time Processing**: Provide near real-time detection and tracking for security and monitoring applications
+- **Cost-Effective Solution**: Utilize open-source models and efficient algorithms to minimize operational costs
+- **Scalability**: Support multiple video feeds simultaneously with modular architecture
+
+### Target Use Cases
+1. **Security & Surveillance**: Monitor restricted areas and track persons of interest
+2. **Retail Analytics**: Track customer movement patterns and behavior in stores
+3. **Traffic Management**: Monitor vehicle and pedestrian traffic in urban environments
+4. **Event Management**: Track attendee movement and crowd density at large events
+5. **Industrial Safety**: Monitor worker presence in hazardous zones
+
+### Success Criteria
+- Accurate object detection with configurable confidence thresholds
+- Reliable person re-identification across video frames
+- Responsive web interface for easy operation by non-technical users
+- Support for common video formats and resolutions
+- Minimal hardware requirements with GPU acceleration support
+
+### Constraints
+- Must support GPU acceleration (CUDA/MPS) and CPU fallback
+- Must provide REST API for integration with external systems
+- Must maintain user privacy and data security standards
+- Must be deployable on standard server infrastructure
+
 ## Project Structure
 
 ```
@@ -32,6 +64,11 @@ Multi-Feed_Tracker/
 ├── llm/                      # LLM integration
 │   ├── __init__.py
 │   └── image_describer.py   # Claude API for object labeling
+│
+├── re_id/                    # Person Re-Identification (optional)
+│   ├── __init__.py
+│   ├── embedding_extractor.py  # fast-reid embedding extraction
+│   └── matcher.py             # Cosine similarity matching
 │
 ├── utils/                    # Utility functions
 │   ├── __init__.py
@@ -90,18 +127,42 @@ Or press `Ctrl+C` in the terminal running `start_app.sh`.
 1. Start the application with `./start_app.sh`
 2. Open http://localhost:8000 in your browser
 3. Upload a video file
-4. Choose tracking mode:
-   - **Track**: Manual tracker placement with CSRT tracking
-   - **Identify**: Automatic detection with AI labeling
+4. Choose mode:
+   - **Identify**: Text-based object detection (e.g., "person", "car")
+   - **Track**: Draw a box to track a specific object (CSRT + AI labeling)
+   - **Re-ID**: Find a person across two videos (upload video 1, draw box, upload video 2)
 
-### 2. Video Tracking with Object Detection
+### 2. Re-ID Mode Setup (Optional)
+
+Re-ID uses [fast-reid](https://github.com/JDAI-CV/fast-reid) for person re-identification. Install it separately:
+
+```bash
+# Clone fast-reid
+git clone https://github.com/JDAI-CV/fast-reid.git
+cd fast-reid
+pip install -r requirements.txt
+python setup.py develop
+cd ..
+pip install faiss-cpu opencv-python
+```
+
+Download a pretrained model (e.g., from the [fast-reid Model Zoo](https://github.com/JDAI-CV/fast-reid/blob/master/MODEL_ZOO.md)) and place it as `fast-reid/model.pth`, or set environment variables:
+
+```bash
+export FAST_REID_PATH=/path/to/fast-reid
+export REID_WEIGHTS_PATH=/path/to/model.pth   # e.g. bagtricks_R50_market.pth
+export REID_CONFIG_PATH=/path/to/fast-reid/configs/Market1501/bagtricks_R50.yml
+export REID_DEVICE=cuda   # or cpu, mps
+```
+
+### 3. Video Tracking with Object Detection
 
 **Run video tracking pipeline:**
 ```bash
 python starter.py  # Uncomment Demo 1 in starter.py
 ```
 
-### 3. Programmatic Usage
+### 4. Programmatic Usage
 
 **Object Detection:**
 ```python
@@ -123,6 +184,7 @@ Edit `config.py` to customize:
 - Detection thresholds
 - Visualization colors and styles
 - Default labels
+- Re-ID: `REID_CONFIG_PATH`, `REID_WEIGHTS_PATH`, `REID_DEVICE`, `REID_MATCH_THRESHOLD` (env vars)
 
 ## Requirements
 
@@ -144,6 +206,7 @@ Edit `config.py` to customize:
 
 ## Features
 
+- ✅ **Re-ID mode**: Find a person across two videos (fast-reid)
 - ✅ Multi-object tracking with CSRT
 - ✅ AI-powered object labeling with Claude API
 - ✅ Detect-then-track cycle for automatic detection mode

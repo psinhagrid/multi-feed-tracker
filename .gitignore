@@ -42,10 +42,20 @@ models/
 *.bin
 *.safetensors
 .cache/
+.matplotlib_cache/
 huggingface/
 
 # ByteTrack (cloned repository)
 tracker/bytetrack/
+
+# fast-reid (cloned by setup_reid.sh — not committed, too large)
+fast-reid/
+
+# Uploaded videos / temp files
+uploads/
+*.mp4
+*.avi
+*.mov
 
 # Images and videos (uncomment if you don't want to track them)
 # *.jpg

@@ -5,6 +5,10 @@ echo "=========================================="
 echo "Multi-Feed Tracker - Starting Services"
 echo "=========================================="
 
+# Ensure we're in project root (where .env lives)
+cd "$(dirname "$0")"
+PROJECT_ROOT="$(pwd)"
+
 # Check if virtual environment is activated
 if [ -z "$VIRTUAL_ENV" ]; then
     echo "⚠️  Virtual environment not activated"
@@ -20,19 +24,25 @@ if [ ! -d "frontend/vision-explorer/node_modules" ]; then
     cd ../..
 fi
 
-# Start backend in background
+# Start backend in background (from project root so .env is found)
 echo ""
 echo "🚀 Starting FastAPI backend on port 8080..."
-python app.py > backend.log 2>&1 &
+# Use project cache dirs to avoid sandbox permission issues
+export MPLCONFIGDIR="${PROJECT_ROOT}/.matplotlib_cache"
+export XDG_CACHE_HOME="${PROJECT_ROOT}/.cache"
+export HF_HOME="${PROJECT_ROOT}/.cache/huggingface"
+export HF_HUB_CACHE="${PROJECT_ROOT}/.cache/huggingface/hub"
+mkdir -p "$MPLCONFIGDIR" "$XDG_CACHE_HOME" "$HF_HUB_CACHE" 2>/dev/null || true
+cd "$PROJECT_ROOT" && PYTHONUNBUFFERED=1 uvicorn app:app --reload --host 127.0.0.1 --port 8080 > backend.log 2>&1 &
 BACKEND_PID=$!
 echo "   Backend PID: $BACKEND_PID"
 
-# Wait for backend to start (give it more time for matplotlib/fontconfig warnings)
+# Wait for backend to start (matplotlib font cache can take 20-30s on first run)
 echo "   Waiting for backend to initialize..."
-sleep 5
+sleep 8
 
 # Check if backend started successfully
-MAX_ATTEMPTS=5
+MAX_ATTEMPTS=15
 ATTEMPT=0
 while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     if curl -s http://localhost:8080/ > /dev/null 2>&1; then
@@ -42,7 +52,7 @@ while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
     ATTEMPT=$((ATTEMPT + 1))
     if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
         echo "   Attempt $ATTEMPT/$MAX_ATTEMPTS - waiting..."
-        sleep 2
+        sleep 3
     fi
 done
 

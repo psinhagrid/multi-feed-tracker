@@ -1,5 +1,8 @@
 """Configuration settings for the object detection system."""
 
+import os
+from pathlib import Path
+
 # Model configuration
 MODEL_ID = "IDEA-Research/grounding-dino-tiny"
 
@@ -25,3 +28,18 @@ TEXT_BACKGROUND = 'white'
 
 # Default labels (can be overridden)
 DEFAULT_LABELS = ["Person"]
+
+# Re-ID (fast-reid) settings
+# Set FAST_REID_PATH to the cloned fast-reid repo root, e.g. /path/to/fast-reid
+# Or set REID_CONFIG_PATH and REID_WEIGHTS_PATH directly via env
+FAST_REID_PATH = os.getenv("FAST_REID_PATH", str(Path(__file__).parent / "fast-reid"))
+REID_CONFIG_PATH = os.getenv(
+    "REID_CONFIG_PATH",
+    str(Path(FAST_REID_PATH) / "configs" / "Market1501" / "bagtricks_R50.yml"),
+)
+REID_WEIGHTS_PATH = os.getenv(
+    "REID_WEIGHTS_PATH",
+    str(Path(FAST_REID_PATH) / "model.pth"),
+)
+REID_DEVICE = os.getenv("REID_DEVICE", "cuda")  # or "cpu", "mps"
+REID_MATCH_THRESHOLD = float(os.getenv("REID_MATCH_THRESHOLD", "0.5"))
