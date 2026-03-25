@@ -74,6 +74,69 @@ detector = None
 active_sessions: Dict[str, Dict[str, Any]] = {}
 reid_sessions: Dict[str, Dict[str, Any]] = {}
 reid_extractor = None
+yolo_seg_model = None   # yolov8n-seg.pt — Re-ID detection + segmentation
+
+
+def get_yolo_seg():
+    """Lazy-load YOLOv8 segmentation model (auto-downloads on first use)."""
+    global yolo_seg_model
+    if yolo_seg_model is None:
+        from ultralytics import YOLO
+        model_name = getattr(config, "YOLO_SEG_MODEL", "yolov8n-seg.pt")
+        yolo_seg_model = YOLO(model_name)
+        print(f"[Re-ID] YOLO seg model loaded: {model_name}", flush=True)
+    return yolo_seg_model
+
+
+def clothing_hue_histogram(crop: "np.ndarray") -> "np.ndarray":
+    """
+    Extract a normalised hue histogram from the torso region of a masked crop.
+    Only counts foreground pixels (V>25, S>40) so black YOLO-mask background
+    and achromatic clothing are handled gracefully.
+    Returns a 18-bin float32 array, or None if too few colourful pixels.
+    """
+    import numpy as np
+    import cv2 as _cv2
+    h = crop.shape[0]
+    torso = crop[h // 4: 3 * h // 4, :]
+    if torso.size == 0:
+        torso = crop
+    hsv = _cv2.cvtColor(torso, _cv2.COLOR_BGR2HSV)
+    fg = (hsv[:, :, 2] > 25) & (hsv[:, :, 1] > 40)
+    hues = hsv[:, :, 0][fg]
+    if len(hues) < 30:
+        return None
+    hist, _ = np.histogram(hues, bins=18, range=(0, 180))
+    hist = hist.astype(np.float32)
+    s = hist.sum()
+    return hist / s if s > 0 else None
+
+
+def hue_similarity(hist_a: "np.ndarray", hist_b: "np.ndarray") -> float:
+    """Bhattacharyya coefficient between two hue histograms (0=different, 1=identical)."""
+    import numpy as np
+    if hist_a is None or hist_b is None:
+        return 1.0   # unknown → don't penalise
+    return float(np.clip(np.sum(np.sqrt(hist_a * hist_b)), 0.0, 1.0))
+
+
+def apply_yolo_seg_mask(yolo, image: "np.ndarray", conf: float = 0.3) -> "np.ndarray":
+    """
+    Run yolov8n-seg on `image` (BGR), find the highest-confidence person,
+    apply its segmentation mask, and return the masked image.
+    Falls back to the raw image if no person is detected.
+    """
+    import numpy as np
+    results = yolo(image, classes=[0], conf=conf, verbose=False)
+    result = results[0]
+    if result.masks is not None and len(result.masks) > 0:
+        fh, fw = image.shape[:2]
+        best_idx = int(result.boxes.conf.argmax())
+        mask_np = result.masks.data[best_idx].cpu().numpy()
+        mask_resized = cv2.resize(mask_np, (fw, fh), interpolation=cv2.INTER_NEAREST)
+        fg = (mask_resized > 0.5).astype(np.uint8)
+        return image * fg[:, :, np.newaxis]
+    return image
 
 
 def get_reid_extractor_cached():
@@ -963,7 +1026,14 @@ async def reid_set_reference(
     bbox = (x_px, y_px, w_px, h_px)
 
     try:
-        embedding = ext.extract_roi(frame, bbox)
+        # Crop the drawn box, apply YOLO-seg mask to remove background, then embed
+        x_c, y_c, w_c, h_c = [int(v) for v in bbox]
+        ref_crop = frame[y_c:y_c + h_c, x_c:x_c + w_c]
+        if ref_crop.size == 0:
+            raise ValueError("Empty crop from drawn box")
+        yolo = get_yolo_seg()
+        ref_crop_masked = apply_yolo_seg_mask(yolo, ref_crop, conf=0.2)
+        embedding = ext.extract(ref_crop_masked)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to extract embedding: {e}")
 
@@ -975,6 +1045,10 @@ async def reid_set_reference(
 
     # Store as list for JSON compatibility; we use numpy when matching
     session["reference_embedding"] = embedding.tolist()
+    session["reference_crop"] = ref_crop_masked
+    # Pre-compute hue histogram for clothing-colour veto during tracking
+    ref_hue_hist = clothing_hue_histogram(ref_crop_masked)
+    session["reference_hue_hist"] = ref_hue_hist.tolist() if ref_hue_hist is not None else None
     session["reference_frame"] = frame  # keep for display
     session["reference_label"] = ref_label
     session["step"] = "upload_v2"
@@ -1023,7 +1097,7 @@ async def reid_upload_video2(session_id: str, file: UploadFile = File(...)):
 @app.get("/api/reid-stream/{session_id}")
 async def reid_stream(
     session_id: str,
-    detection_interval: int = 15,
+    detection_interval: int = 5,
     threshold: float = 0.5,
 ):
     """
@@ -1039,14 +1113,24 @@ async def reid_stream(
         raise HTTPException(status_code=400, detail="Complete steps 1–3: set reference and upload video 2")
 
     ext = get_reid_extractor_cached()
-    det = get_detector()
     if not ext:
         raise HTTPException(status_code=503, detail="Re-ID model not available")
 
     import numpy as np
-    ref_emb_np = np.array(ref_emb, dtype=np.float32)
     match_thresh = getattr(config, "REID_MATCH_THRESHOLD", 0.5)
     ref_label = session.get("reference_label", "person")
+
+    _ref_hue_raw = session.get("reference_hue_hist")
+    ref_hue_hist = np.array(_ref_hue_raw, dtype=np.float32) if _ref_hue_raw else None
+
+    # Wrap in a dict so inner closures can mutate it without triggering
+    # Python's "local variable referenced before assignment" error.
+    ref_state = {
+        "emb":         np.array(ref_emb, dtype=np.float32),
+        "adapted":     False,
+        "adapt_count": 0,       # consecutive qualifying confirmations before adapting
+        "hue_hist":    ref_hue_hist,
+    }
 
     def generate_frames():
         import time
@@ -1058,6 +1142,7 @@ async def reid_stream(
         # trackers: list of (tracker, matched, sim, last_box)
         trackers = []
         last_boxes = []
+        # ref_state["adapted"] tracks whether we've updated to a video-2 embedding.
 
         # ── Background detection + Re-ID thread ──────────────────────────────
         # Detection + Re-ID is expensive (1-5s on CPU). Run it in a background
@@ -1065,108 +1150,101 @@ async def reid_stream(
         det_lock = threading.Lock()
         det_state = {
             "running": False,
-            "new_results": None,    # list of (box_xyxy, matched, sim)
+            "new_results": None,     # list of (box_xyxy, matched, sim)
             "detection_frame": None, # the EXACT frame detection ran on (use for tracker.init)
+            "all_candidates": [],    # every detected person's sim — drawn on-screen for debugging
+            "chosen_emb": None,      # embedding of the chosen person (for reference adaptation)
         }
+        # All candidates from last detection — drawn as dim boxes so user can
+        # see every person's similarity score on-screen
+        last_candidates = []
 
-        # How much better a NEW person's sim must be to override spatial continuity.
-        # Prevents brief switches to a wrong person with only marginally higher score.
-        SWITCH_SIM_MARGIN = 0.02
+        def _iou(a, b):
+            ax1, ay1, ax2, ay2 = a
+            bx1, by1, bx2, by2 = b
+            ix = max(0, min(ax2, bx2) - max(ax1, bx1))
+            iy = max(0, min(ay2, by2) - max(ay1, by1))
+            inter = ix * iy
+            union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+            return inter / max(1, union)
 
-        def run_detection_reid(frame_copy, last_tracked_box=None):
-            """Run detect + Re-ID on a copy of the frame; store result in det_state.
-
-            last_tracked_box: (x1,y1,x2,y2) of the currently tracked person.
-            Used for spatial consistency — prefer the candidate near the current
-            position unless another person scores SWITCH_SIM_MARGIN higher.
-            """
+        def run_detection_reid(frame_copy):
+            """Run YOLO-seg detect + Re-ID on a frame copy; store best match in det_state."""
             new_results = []
             t0 = time.time()
             try:
-                h, w = frame_copy.shape[:2]
-                nw = config.RESIZE_WIDTH
-                nh = int(h * (nw / w))
-                resized = cv2.resize(frame_copy, (nw, nh))
-                pil_img = Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))
 
+                # ── YOLO-seg: detect all persons + get per-person masks in one pass ──
+                fh, fw = frame_copy.shape[:2]
+                yolo = get_yolo_seg()
                 t_det = time.time()
-                results, _ = det.detect(pil_img, ["person"], threshold=threshold)
-                detections = [(b, s) for b, s in zip(results["boxes"], results["scores"]) if s >= threshold]
-                detections = sorted(detections, key=lambda x: -x[1])[:10]
-                print(f"[Re-ID] DINO detect: {len(detections)} people in {time.time()-t_det:.2f}s", flush=True)
+                yolo_results = yolo(frame_copy, classes=[0], conf=threshold,
+                                    verbose=False, imgsz=640)
+                yolo_result = yolo_results[0]
+                n_det = len(yolo_result.boxes) if yolo_result.boxes is not None else 0
+                print(f"[Re-ID] YOLO detect: {n_det} people in {time.time()-t_det:.2f}s", flush=True)
 
-                scale_x, scale_y = w / nw, h / nh
                 candidates = []  # list of (box_xyxy, matched, sim)
-                for i, (box, score) in enumerate(detections):
-                    x1, y1, x2, y2 = box.tolist()
-                    x1, x2 = int(x1 * scale_x), int(x2 * scale_x)
-                    y1, y2 = int(y1 * scale_y), int(y2 * scale_y)
-                    roi = frame_copy[y1:y2, x1:x2]
-                    if roi.size == 0:
-                        print(f"  person {i+1}: empty ROI, skipping")
+                for i, box in enumerate(yolo_result.boxes):
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    # Clamp to frame bounds
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(fw, x2), min(fh, y2)
+                    box_w, box_h = x2 - x1, y2 - y1
+
+                    # Skip merged detections (too wide relative to height)
+                    if box_h > 0 and (box_w / box_h) > 0.65:
+                        print(f"  person {i+1}: skipping wide box (ratio={box_w/box_h:.2f})")
                         continue
+
+                    # Build segmentation-masked crop using YOLO-seg mask
+                    crop = frame_copy[y1:y2, x1:x2].copy()
+                    if crop.size == 0:
+                        continue
+                    if yolo_result.masks is not None and i < len(yolo_result.masks):
+                        mask_np = yolo_result.masks.data[i].cpu().numpy()
+                        mask_full = cv2.resize(mask_np, (fw, fh),
+                                               interpolation=cv2.INTER_NEAREST)
+                        fg = (mask_full[y1:y2, x1:x2] > 0.5).astype(np.uint8)
+                        crop = crop * fg[:, :, np.newaxis]
+
                     t_reid = time.time()
                     try:
-                        query_emb = ext.extract(roi)
-                        matched, sim = is_match(ref_emb_np, query_emb, match_thresh)
+                        query_emb = ext.extract(crop)   # L2-normalised, crop already masked
+                        _, sim = is_match(ref_state["emb"], query_emb, match_thresh)
+
+                        # Colour veto: if clothing hue is clearly wrong, reduce score.
+                        # We don't blend 50/50 — we just penalise obvious mismatches.
+                        # Threshold 0.25: below this the hue distributions barely overlap.
+                        HUE_VETO_THRESH = 0.25
+                        cand_hist = clothing_hue_histogram(crop)
+                        hue_sim   = hue_similarity(ref_state["hue_hist"], cand_hist)
+                        if hue_sim < HUE_VETO_THRESH:
+                            sim = sim * 0.5   # heavy penalty for clearly wrong colour
+                        matched = sim >= match_thresh
                     except Exception as re:
-                        matched, sim = False, 0.0
+                        query_emb, matched, sim, hue_sim = None, False, 0.0, 0.0
                         print(f"  person {i+1}: Re-ID extract FAILED: {re}")
-                    candidates.append(((x1, y1, x2, y2), matched, sim))
-                    print(f"  person {i+1}: sim={sim:.3f} matched={matched} reid_time={time.time()-t_reid:.2f}s box=({x1},{y1},{x2},{y2})")
+                    candidates.append(((x1, y1, x2, y2), matched, sim, query_emb))
+                    print(f"  person {i+1}: sim={sim:.3f} hue={hue_sim:.3f} "
+                          f"reid_time={time.time()-t_reid:.2f}s box=({x1},{y1},{x2},{y2})")
 
+                chosen_emb_out = None
                 if candidates:
-                    # Sort by similarity descending
-                    candidates.sort(key=lambda c: -c[2])
-                    global_best = candidates[0]
-                    global_best_sim = global_best[2]
-
-                    chosen = global_best  # default: highest similarity
-
-                    # ── Spatial consistency ───────────────────────────────────
-                    # If we already have a tracked position, find which candidate
-                    # is spatially closest to it. Prefer that candidate UNLESS
-                    # the globally highest-sim candidate is clearly better
-                    # (margin > SWITCH_SIM_MARGIN). This prevents brief flashes to
-                    # a wrong person with a marginally higher score.
-                    if last_tracked_box is not None:
-                        lx1, ly1, lx2, ly2 = last_tracked_box
-                        last_cx = (lx1 + lx2) / 2.0
-                        last_cy = (ly1 + ly2) / 2.0
-
-                        # Find nearest candidate to current tracked position
-                        nearest = min(
-                            candidates,
-                            key=lambda c: (
-                                ((c[0][0] + c[0][2]) / 2.0 - last_cx) ** 2
-                                + ((c[0][1] + c[0][3]) / 2.0 - last_cy) ** 2
-                            ),
-                        )
-                        nearest_sim = nearest[2]
-
-                        # Only switch away from the spatially-nearest if the
-                        # global best is significantly better
-                        if global_best_sim - nearest_sim <= SWITCH_SIM_MARGIN:
-                            chosen = nearest
-                            print(
-                                f"[Re-ID] Spatial lock: keeping nearest candidate "
-                                f"(sim={nearest_sim:.3f}) over global best "
-                                f"(sim={global_best_sim:.3f}, gap={global_best_sim-nearest_sim:.3f} < {SWITCH_SIM_MARGIN})",
-                                flush=True,
-                            )
-                        else:
-                            print(
-                                f"[Re-ID] Switching to higher-sim candidate "
-                                f"(sim={global_best_sim:.3f} vs nearest={nearest_sim:.3f}, "
-                                f"gap={global_best_sim-nearest_sim:.3f} >= {SWITCH_SIM_MARGIN})",
-                                flush=True,
-                            )
-
+                    chosen = max(candidates, key=lambda c: c[2])
                     if chosen[2] >= 0.2:
-                        new_results = [chosen]
-                        print(f"[Re-ID] Chosen: sim={chosen[2]:.3f} matched={chosen[1]} box={chosen[0]}", flush=True)
+                        # Strip emb from new_results (main loop only needs box/matched/sim)
+                        new_results = [(chosen[0], chosen[1], chosen[2])]
+                        chosen_emb_out = chosen[3]
+                        print(f"[Re-ID] ★ Chosen: sim={chosen[2]:.3f} box={chosen[0]} "
+                              f"| all: {[(round(c[2],3), c[0]) for c in candidates]}", flush=True)
                     else:
-                        print(f"[Re-ID] No confident match (best sim={chosen[2]:.3f} < 0.2). All: {[f'{c[2]:.2f}' for c in candidates]}", flush=True)
+                        print(f"[Re-ID] No match (best={chosen[2]:.3f} < 0.2) "
+                              f"| all: {[round(c[2],3) for c in candidates]}", flush=True)
+
+                # Store candidates (without emb arrays) for on-screen debug boxes
+                with det_lock:
+                    det_state["all_candidates"] = [(c[0], c[1], c[2]) for c in candidates]
 
                 print(f"[Re-ID] Total detection+reid time: {time.time()-t0:.2f}s", flush=True)
             except Exception as e:
@@ -1176,7 +1254,8 @@ async def reid_stream(
             finally:
                 with det_lock:
                     det_state["new_results"] = new_results
-                    det_state["detection_frame"] = frame_copy  # keep so tracker.init uses the right frame
+                    det_state["detection_frame"] = frame_copy
+                    det_state["chosen_emb"] = chosen_emb_out
                     det_state["running"] = False
 
         # ─────────────────────────────────────────────────────────────────────
@@ -1202,6 +1281,7 @@ async def reid_stream(
                     tr.init(init_frame_warm, (x1, y1, x2 - x1, y2 - y1))
                     trackers.append((tr, matched, sim, (x1, y1, x2, y2), 0))
                     last_boxes.append(((x1, y1, x2, y2), matched, sim))
+                    pass  # ref_state["adapted"] stays False until first confident detection
                 print(f"[Re-ID] Warm-up done: {len(trackers)} tracker(s) ready", flush=True)
         # ─────────────────────────────────────────────────────────────────────────
 
@@ -1229,12 +1309,10 @@ async def reid_stream(
                     if not already_running:
                         with det_lock:
                             det_state["running"] = True
-                        # Pass current tracked position for spatial consistency check
-                        current_tracked_box = last_boxes[0][0] if last_boxes else None
-                        print(f"[Re-ID] Scheduling detection thread at frame {frame_idx} last_box={current_tracked_box}", flush=True)
+                        print(f"[Re-ID] Scheduling detection thread at frame {frame_idx}", flush=True)
                         t = threading.Thread(
                             target=run_detection_reid,
-                            args=(frame.copy(), current_tracked_box),
+                            args=(frame.copy(),),
                             daemon=True,
                         )
                         t.start()
@@ -1249,18 +1327,134 @@ async def reid_stream(
                         det_state["new_results"] = None
                         det_state["detection_frame"] = None
 
-                if new_results is not None:
-                    # Reinit trackers — MUST use the frame detection actually ran on,
-                    # not the current frame (person may have moved since detection ran).
-                    print(f"[Re-ID] Frame {frame_idx}: applying new detection ({len(new_results)} results), reinit trackers on detection frame", flush=True)
-                    trackers = []
-                    last_boxes = []
-                    for (x1, y1, x2, y2), matched, sim in new_results:
+                if new_results:  # truthy: non-empty list ([] means no match found)
+                    (nx1, ny1, nx2, ny2), n_matched, n_sim = new_results[0]
+                    chosen_emb = det_state.get("chosen_emb")
+                    all_cands  = det_state.get("all_candidates", [])
+
+                    # ── Reference adaptation (one-shot) ──────────────────────────
+                    # The reference was extracted from video 1. Due to cross-camera
+                    # domain shift all video-2 similarities cluster at 0.93–0.97,
+                    # making discrimination hard. Once we see one confident,
+                    # unambiguous detection we update ref_emb_np to the video-2
+                    # embedding so subsequent comparisons are within the same domain
+                    # and give clear gaps (0.97 correct vs 0.82 others).
+                    if not ref_state["adapted"] and chosen_emb is not None and len(all_cands) == 1:
+                        # Guard: the solo detection must be near the person we are currently
+                        # tracking. A solo detection that is far from the tracker is a
+                        # different person — adapting on it permanently corrupts the reference.
+                        # (No tracker yet at warm-up → allow unconditionally.)
+                        _solo_near_tracker = True
+                        if last_boxes:
+                            _lx1, _ly1, _lx2, _ly2 = last_boxes[0][0]
+                            _solo_iou = _iou((_lx1, _ly1, _lx2, _ly2), (nx1, ny1, nx2, ny2))
+                            _solo_near_tracker = _solo_iou > 0.20
+                            if not _solo_near_tracker:
+                                ref_state["adapt_count"] = 0  # reset streak — different person
+                                print(f"[Re-ID] Skip adaptation: solo detection far from "
+                                      f"tracker (IoU={_solo_iou:.2f}) — different person",
+                                      flush=True)
+
+                        if _solo_near_tracker:
+                            # Require 3 consecutive qualifying detections of OUR tracked person
+                            # before locking in. The hue histogram is anchored to video-1 and
+                            # is never overwritten.
+                            _adapt_crop = init_frame[ny1:ny2, nx1:nx2] if init_frame is not None else None
+                            _adapt_hist = clothing_hue_histogram(_adapt_crop) if (
+                                _adapt_crop is not None and _adapt_crop.size > 0) else None
+                            _adapt_hue  = hue_similarity(ref_state["hue_hist"], _adapt_hist)
+
+                            if n_sim >= 0.80 and _adapt_hue >= 0.35:
+                                ref_state["adapt_count"] += 1
+                                if ref_state["adapt_count"] >= 3:
+                                    ref_state["emb"] = chosen_emb
+                                    ref_state["adapted"] = True
+                                    print(f"[Re-ID] ✓ Reference adapted to video-2 domain "
+                                          f"(sim={n_sim:.3f} hue={_adapt_hue:.3f} count=3)", flush=True)
+                                else:
+                                    print(f"[Re-ID] Adaptation candidate "
+                                          f"{ref_state['adapt_count']}/3 "
+                                          f"(sim={n_sim:.3f} hue={_adapt_hue:.3f})", flush=True)
+                            else:
+                                ref_state["adapt_count"] = 0  # mismatch breaks the streak
+                                print(f"[Re-ID] Skip adaptation: sim={n_sim:.3f} "
+                                      f"hue={_adapt_hue:.3f} (wrong colour or low confidence)",
+                                      flush=True)
+
+                    # ── Simple gap-based stability ────────────────────────────────
+                    # Require the winner to be clearly ahead of the second-best.
+                    # Only applies once we're tracking someone (last_boxes set).
+                    SWITCH_THRESHOLD = 0.05
+                    if last_boxes and len(all_cands) >= 2:
+                        sorted_cands = sorted(all_cands, key=lambda c: c[2], reverse=True)
+                        best_sim   = sorted_cands[0][2]
+                        second_sim = sorted_cands[1][2]
+                        if best_sim - second_sim < SWITCH_THRESHOLD:
+                            # Scores too close — find which candidate overlaps current
+                            # tracked box and keep that one instead of switching
+                            last_box_coords = last_boxes[0][0]
+                            best_match = max(all_cands,
+                                             key=lambda c: _iou(last_box_coords, c[0]))
+                            if _iou(last_box_coords, best_match[0]) > 0.25:
+                                nx1,ny1,nx2,ny2 = best_match[0]
+                                n_matched = best_match[1]
+                                n_sim     = best_match[2]
+                                print(f"[Re-ID] Gap too small ({best_sim:.3f}-{second_sim:.3f}"
+                                      f"={best_sim-second_sim:.3f}), keeping current box",
+                                      flush=True)
+
+                    # Smart reinit logic:
+                    #
+                    # Case A — detection agrees with tracker (IoU > 0.30):
+                    #   Keep the running tracker, just update the sim/matched metadata.
+                    #
+                    # Case B — detection is FAR from a healthy tracker (IoU < 0.30)
+                    #   AND the new sim is not meaningfully higher than what we already track:
+                    #   This is a missed-detection — YOLO failed to find the correct person
+                    #   and is returning someone else. Keep tracking, discard the result.
+                    #   Example from logs: tracker on person at x=252 (sim=0.968), YOLO
+                    #   only detects person at x=670 (sim=0.949). 0.949 < 0.968+0.03 → ignore.
+                    #
+                    # Case C — detection is far from tracker AND the new sim is clearly
+                    #   higher (> current + 0.03): the tracker has drifted to the wrong
+                    #   person and the correct person was just found. Reinit on current frame.
+                    #   Example: tracker on wrong person (sim=0.930), correct person detected
+                    #   at sim=0.993. 0.993 > 0.930+0.03 → reinit.
+                    should_reinit = True
+                    if trackers and last_boxes:
+                        lx1, ly1, lx2, ly2 = last_boxes[0][0]
+                        current_fail_count  = trackers[0][4]
+                        current_tracked_sim = trackers[0][2]
+                        det_iou = _iou((lx1, ly1, lx2, ly2), (nx1, ny1, nx2, ny2))
+
+                        if det_iou > 0.30:
+                            # Case A: detection and tracker agree — keep the CSRT box
+                            # as the drawn box. Using the YOLO detection box here would
+                            # cause size fluctuation because YOLO and CSRT produce
+                            # differently-sized bounding boxes (YOLO = full body,
+                            # CSRT = learned region). Only sim/matched metadata updates.
+                            existing_tr = trackers[0][0]
+                            trackers   = [(existing_tr, n_matched, n_sim, (nx1, ny1, nx2, ny2), 0)]
+                            last_boxes = [((lx1, ly1, lx2, ly2), n_matched, n_sim)]
+                            should_reinit = False
+                            print(f"[Re-ID] Frame {frame_idx}: tracker agrees with detection "
+                                  f"(IoU={det_iou:.2f}), keeping tracker sim={n_sim:.3f}", flush=True)
+                        elif current_fail_count == 0 and n_sim <= current_tracked_sim + 0.03:
+                            # Case B: missed detection — YOLO lost the correct person
+                            last_boxes = [((lx1, ly1, lx2, ly2), trackers[0][1], current_tracked_sim)]
+                            should_reinit = False
+                            print(f"[Re-ID] Frame {frame_idx}: missed detection "
+                                  f"(IoU={det_iou:.2f}, new_sim={n_sim:.3f} vs tracked={current_tracked_sim:.3f})"
+                                  f" — keeping healthy tracker", flush=True)
+                        # else Case C: fall through → reinit below
+
+                    if should_reinit:
+                        print(f"[Re-ID] Frame {frame_idx}: reinit tracker on current frame "
+                              f"sim={n_sim:.3f} box=({nx1},{ny1},{nx2},{ny2})", flush=True)
                         tr = create_tracker()
-                        tr.init(init_frame, (x1, y1, x2 - x1, y2 - y1))
-                        # (tracker, matched, sim, last_box, fail_count)
-                        trackers.append((tr, matched, sim, (x1, y1, x2, y2), 0))
-                        last_boxes.append(((x1, y1, x2, y2), matched, sim))
+                        tr.init(frame, (nx1, ny1, nx2 - nx1, ny2 - ny1))
+                        trackers   = [(tr, n_matched, n_sim, (nx1, ny1, nx2, ny2), 0)]
+                        last_boxes = [((nx1, ny1, nx2, ny2), n_matched, n_sim)]
                 else:
                     # CSRT update every frame — instant, no stalling
                     last_boxes = []
@@ -1271,11 +1465,36 @@ async def reid_stream(
                         track_ms = (time.time() - t_track) * 1000
                         if ok:
                             x, y, bw, bh = [int(v) for v in bbox]
+                            # Clip to frame bounds — CSRT can drift outside the frame
+                            fh, fw = frame.shape[:2]
+                            x  = max(0, min(x, fw - 1))
+                            y  = max(0, min(y, fh - 1))
+                            bw = max(1, min(bw, fw - x))
+                            bh = max(1, min(bh, fh - y))
                             new_box = (x, y, x + bw, y + bh)
-                            last_boxes.append((new_box, matched, sim))
-                            updated.append((tr, matched, sim, new_box, 0))
-                            if frame_idx % 30 == 0:
-                                print(f"[Re-ID] Frame {frame_idx}: tracker OK box={new_box} ({track_ms:.1f}ms)", flush=True)
+
+                            # Drift guard: if the tracker box has moved too far from the
+                            # last confirmed detection box, it has likely drifted to a
+                            # different person. Discard the update and hold last_box.
+                            lx1, ly1, lx2, ly2 = last_box
+                            last_cx, last_cy = (lx1 + lx2) / 2.0, (ly1 + ly2) / 2.0
+                            new_cx, new_cy = (x + x + bw) / 2.0, (y + y + bh) / 2.0
+                            center_drift = ((last_cx - new_cx) ** 2 + (last_cy - new_cy) ** 2) ** 0.5
+                            last_area = max(1, (lx2 - lx1) * (ly2 - ly1))
+                            new_area = bw * bh
+                            area_ratio = new_area / last_area
+
+                            if center_drift > 250 or area_ratio > 2.0 or area_ratio < 0.3:
+                                # Tracker drifted — hold position, wait for next detection
+                                print(f"[Re-ID] Frame {frame_idx}: tracker DRIFT detected "
+                                      f"(center_drift={center_drift:.0f}px, area_ratio={area_ratio:.2f}) — holding last box", flush=True)
+                                last_boxes.append((last_box, matched, sim))
+                                updated.append((tr, matched, sim, last_box, fail_count + 1))
+                            else:
+                                last_boxes.append((new_box, matched, sim))
+                                updated.append((tr, matched, sim, new_box, 0))
+                                if frame_idx % 30 == 0:
+                                    print(f"[Re-ID] Frame {frame_idx}: tracker OK box={new_box} drift={center_drift:.0f}px ({track_ms:.1f}ms)", flush=True)
                         else:
                             fail_count += 1
                             print(f"[Re-ID] Frame {frame_idx}: tracker FAILED fail_count={fail_count} ({track_ms:.1f}ms)", flush=True)
@@ -1309,7 +1528,12 @@ async def reid_stream(
 
             cap.release()
             frame_idx = 0
-            # Keep trackers and last_boxes across loop so box stays visible at restart
+            # Reset tracker at loop boundary. The CSRT internal state from the
+            # last frame of the video is invalid when the video restarts from
+            # frame 0 — the person is at a completely different position.
+            # Detection fires at frame 0 of the new loop and reinits cleanly.
+            trackers = []
+            last_boxes = []
 
         print(f"[Re-ID] Stream ended", flush=True)
 

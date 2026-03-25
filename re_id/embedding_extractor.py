@@ -80,19 +80,20 @@ class ReIDEmbeddingExtractor:
     def extract(self, image: np.ndarray) -> np.ndarray:
         """
         Extract embedding from a single image (BGR, e.g. from cv2.imread).
+        Background masking is expected to be done externally (YOLO-seg in app.py)
+        before calling this method.
 
         Args:
-            image: BGR image as numpy array (H, W, 3)
+            image: BGR image as numpy array (H, W, 3), ideally already masked.
 
         Returns:
-            1D numpy array of shape (2048,) with L2-normalized embedding
+            1D L2-normalised numpy array of shape (2048,)
         """
         import torch
+
         # Preprocess like fast-reid demo: BGR->RGB, resize, to tensor (1,C,H,W)
         image_rgb = image[:, :, ::-1]
-        size_test = getattr(
-            self.cfg.INPUT, "SIZE_TEST", (256, 128)
-        )
+        size_test = getattr(self.cfg.INPUT, "SIZE_TEST", (256, 128))
         if hasattr(size_test, "__iter__") and not isinstance(size_test, str):
             size_tuple = tuple(size_test[::-1]) if len(size_test) == 2 else (256, 128)
         else:
@@ -119,21 +120,28 @@ class ReIDEmbeddingExtractor:
 
         if emb.ndim > 1:
             emb = emb.squeeze()
-        return emb.astype(np.float32)
+
+        emb = emb.astype(np.float32)
+        # Explicit L2 normalisation so stored embeddings are unit-norm and
+        # cosine similarity == dot product (no re-normalisation needed at match time)
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        return emb
 
     def extract_roi(self, frame: np.ndarray, bbox: tuple) -> np.ndarray:
         """
-        Extract embedding from a cropped region of a frame.
+        Extract embedding from a cropped region of a frame (no background masking).
+        For masked extraction, mask the crop externally (YOLO-seg) then call extract().
 
         Args:
             frame: Full BGR frame
             bbox: (x, y, width, height) in pixels
 
         Returns:
-            1D embedding array (2048,)
+            1D L2-normalised embedding array (2048,)
         """
         x, y, w, h = [int(v) for v in bbox]
-        # Clamp to frame bounds
         h_frame, w_frame = frame.shape[:2]
         x1 = max(0, x)
         y1 = max(0, y)
