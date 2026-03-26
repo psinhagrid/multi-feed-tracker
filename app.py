@@ -1246,6 +1246,19 @@ async def reid_stream(
                 with det_lock:
                     det_state["all_candidates"] = [(c[0], c[1], c[2]) for c in candidates]
 
+                # Persist latest scores to session so the UI can poll them.
+                # cx = horizontal centre of the bounding box, used by the UI
+                # to label people by position (left → right).
+                if session_id in reid_sessions:
+                    reid_sessions[session_id]["latest_candidates"] = [
+                        {
+                            "sim": round(float(c[2]), 3),
+                            "matched": bool(c[1]),
+                            "cx": int((c[0][0] + c[0][2]) / 2),
+                        }
+                        for c in candidates
+                    ]
+
                 print(f"[Re-ID] Total detection+reid time: {time.time()-t0:.2f}s", flush=True)
             except Exception as e:
                 import traceback
@@ -1581,6 +1594,30 @@ async def reid_snapshot(session_id: str, source: str = "video1"):
     if not ret:
         raise HTTPException(status_code=500, detail="Could not encode snapshot")
     return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/jpeg")
+
+
+@app.get("/api/reid-reference-crop/{session_id}")
+async def reid_reference_crop(session_id: str):
+    """Return the masked reference person crop as a JPEG for display in the UI."""
+    session = reid_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Re-ID session not found")
+    crop = session.get("reference_crop")
+    if crop is None:
+        raise HTTPException(status_code=404, detail="Reference crop not set yet")
+    ret, buffer = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    if not ret:
+        raise HTTPException(status_code=500, detail="Could not encode crop image")
+    return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/jpeg")
+
+
+@app.get("/api/reid-candidates/{session_id}")
+async def reid_candidates(session_id: str):
+    """Return the similarity scores of all people detected in the latest Re-ID frame."""
+    session = reid_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Re-ID session not found")
+    return {"candidates": session.get("latest_candidates", [])}
 
 
 @app.delete("/api/reid-session/{session_id}")
