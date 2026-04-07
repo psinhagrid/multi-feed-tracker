@@ -75,6 +75,72 @@ active_sessions: Dict[str, Dict[str, Any]] = {}
 reid_sessions: Dict[str, Dict[str, Any]] = {}
 reid_extractor = None
 yolo_seg_model = None   # yolov8n-seg.pt — Re-ID detection + segmentation
+_qwen_model      = None   # Qwen2.5-VL captioning model (lazy-loaded)
+_qwen_processor  = None
+_qwen_load_lock  = None   # set to threading.Lock() on first use
+_qwen_status     = "idle" # idle | loading | ready | error
+_qwen_load_start = None   # time.time() when loading began
+
+
+def get_qwen_captioner():
+    """Lazy-load Qwen2.5-VL-3B for person activity captioning."""
+    global _qwen_model, _qwen_processor, _qwen_load_lock, _qwen_status, _qwen_load_start
+    import threading
+    if _qwen_load_lock is None:
+        _qwen_load_lock = threading.Lock()
+    with _qwen_load_lock:
+        if _qwen_model is not None:
+            return _qwen_model, _qwen_processor
+        if _qwen_status == "error":
+            return None, None
+        try:
+            import torch
+            from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+            model_id = os.getenv("CAPTION_MODEL", "Qwen/Qwen2.5-VL-3B-Instruct")
+            if torch.backends.mps.is_available():
+                dtype  = torch.float16
+                device = "mps"
+            elif torch.cuda.is_available():
+                dtype  = torch.float16
+                device = "cuda"
+            else:
+                dtype  = torch.float32
+                device = "cpu"
+            import time as _time
+            _qwen_status = "loading"
+            _qwen_load_start = _time.time()
+            # Resolve to local snapshot dir so from_pretrained reads files
+            # directly from disk, bypassing HuggingFace's XET cache resolution.
+            from huggingface_hub import snapshot_download as _snap
+            _hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
+            try:
+                local_path = _snap(
+                    model_id, local_files_only=True,
+                    cache_dir=_hf_cache, ignore_patterns=["*.gguf"],
+                )
+            except Exception:
+                local_path = model_id  # fall back to online if not cached
+            print(f"[Caption] Loading {local_path} on {device} …", flush=True)
+            _qwen_processor = AutoProcessor.from_pretrained(local_path)
+            _qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                local_path, torch_dtype=dtype, device_map=device,
+            )
+            _qwen_model.eval()
+            _qwen_status = "ready"
+            print(f"[Caption] Qwen2.5-VL ready on {device}", flush=True)
+        except Exception as exc:
+            import traceback as _tb
+            print(f"[Caption] Could not load Qwen2.5-VL: {exc}", flush=True)
+            _tb.print_exc()
+            _qwen_model     = None
+            _qwen_processor = None
+            _qwen_status    = "error"
+    return _qwen_model, _qwen_processor
+
+
+# Pre-warm Qwen2.5-VL in background so it's ready by the time Re-ID starts
+import threading as _threading
+_threading.Thread(target=get_qwen_captioner, daemon=True).start()
 
 
 def get_yolo_seg():
@@ -1135,6 +1201,7 @@ async def reid_stream(
     def generate_frames():
         import time
         import threading
+        import torch
 
         fps = 30.0
         frame_delay = 1.0 / fps
@@ -1143,6 +1210,66 @@ async def reid_stream(
         trackers = []
         last_boxes = []
         # ref_state["adapted"] tracks whether we've updated to a video-2 embedding.
+
+        # ── Captioning state ─────────────────────────────────────────────────
+        caption_lock   = threading.Lock()
+        caption_buffer = []          # PIL Images (224×224 RGB), sliding window
+        caption_state  = {
+            "running":        False,
+            "last_run_time":  0.0,
+            "last_crop_time": 0.0,
+        }
+
+        def run_captioning(frames_snap):
+            """Run Qwen2.5-VL on a snapshot of the caption buffer."""
+            try:
+                model, processor = get_qwen_captioner()
+                if model is None or processor is None:
+                    return
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        *[{"type": "image", "image": f} for f in frames_snap],
+                        {"type": "text",
+                         "text": "These frames are cropped tightly around a single tracked person over the last few seconds. "
+                                 "In one or two short sentences, describe the sequence of actions this person performed "
+                                 "(e.g. picked up an item, placed it in a cart, then pushed the cart). "
+                                 "Focus only on physical actions. Do not mention other people or the background."},
+                    ],
+                }]
+                text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                # Extract PIL images without qwen_vl_utils dependency
+                images = [
+                    item["image"]
+                    for msg in messages
+                    for item in msg["content"]
+                    if item.get("type") == "image"
+                ]
+                inputs = processor(
+                    text=[text], images=images, return_tensors="pt", padding=True
+                ).to(model.device)
+                with torch.no_grad():
+                    out_ids = model.generate(
+                        **inputs, max_new_tokens=100, do_sample=False
+                    )
+                new_tokens = out_ids[:, inputs["input_ids"].shape[1]:]
+                caption = processor.batch_decode(
+                    new_tokens, skip_special_tokens=True
+                )[0].strip()
+                if session_id in reid_sessions:
+                    reid_sessions[session_id]["latest_caption"] = caption
+                print(f"[Caption] {caption}", flush=True)
+            except Exception as exc:
+                import traceback
+                print(f"[Caption] Error: {exc}", flush=True)
+                traceback.print_exc()
+            finally:
+                with caption_lock:
+                    caption_state["running"]       = False
+                    caption_state["last_run_time"] = time.time()
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── Background detection + Re-ID thread ──────────────────────────────
         # Detection + Re-ID is expensive (1-5s on CPU). Run it in a background
@@ -1532,6 +1659,41 @@ async def reid_stream(
                     cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw, y1), (0, 0, 0), -1)
                     cv2.putText(frame, box_label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
+                # ── Crop matched (green-box) person for captioning ───────────
+                now = time.time()
+                with caption_lock:
+                    since_crop = now - caption_state["last_crop_time"]
+                if last_boxes and last_boxes[0][1] and since_crop > 1.0:  # 1 frame/sec — temporal diversity
+                    bx1, by1, bx2, by2 = last_boxes[0][0]
+                    fh, fw = frame.shape[:2]
+                    bx1c, by1c = max(0, bx1), max(0, by1)
+                    bx2c, by2c = min(fw, bx2), min(fh, by2)
+                    if bx2c > bx1c and by2c > by1c:
+                        crop_bgr = frame[by1c:by2c, bx1c:bx2c]
+                        crop_rgb = cv2.cvtColor(
+                            cv2.resize(crop_bgr, (224, 224)), cv2.COLOR_BGR2RGB
+                        )
+                        pil_crop = Image.fromarray(crop_rgb)
+                        with caption_lock:
+                            caption_buffer.append(pil_crop)
+                            if len(caption_buffer) > 8:
+                                caption_buffer.pop(0)
+                            caption_state["last_crop_time"] = now
+
+                # ── Trigger captioning thread every ~2 s ─────────────────────
+                with caption_lock:
+                    buf_len    = len(caption_buffer)
+                    is_running = caption_state["running"]
+                    last_run   = caption_state["last_run_time"]
+                if buf_len >= 4 and not is_running and (now - last_run) > 3.0:
+                    with caption_lock:
+                        frames_snap = list(caption_buffer)
+                        caption_state["running"] = True
+                    threading.Thread(
+                        target=run_captioning, args=(frames_snap,), daemon=True
+                    ).start()
+                # ─────────────────────────────────────────────────────────────
+
                 ret2, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
 
@@ -1609,6 +1771,21 @@ async def reid_reference_crop(session_id: str):
     if not ret:
         raise HTTPException(status_code=500, detail="Could not encode crop image")
     return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/jpeg")
+
+
+@app.get("/api/reid-caption/{session_id}")
+async def reid_caption_endpoint(session_id: str):
+    """Return the latest Qwen2.5-VL caption and model load status."""
+    session = reid_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Re-ID session not found")
+    import time as _time
+    elapsed = int(_time.time() - _qwen_load_start) if _qwen_load_start and _qwen_status == "loading" else 0
+    return {
+        "caption":      session.get("latest_caption", ""),
+        "model_status": _qwen_status,
+        "load_elapsed": elapsed,
+    }
 
 
 @app.get("/api/reid-candidates/{session_id}")
